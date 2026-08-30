@@ -1,0 +1,3 @@
+Argument expected for the -c option
+usage: .venv/bin/python [option] ... [-c cmd | -m mod | file | -] [arg] ...
+Try `python -h' for more information.

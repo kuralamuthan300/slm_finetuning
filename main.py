@@ -18,7 +18,7 @@ TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
 ROWS_PER_CALL = 10      # Number of rows generated per LLM call
 
 # --- LLM Provider Configuration ---
-MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud Gemini and a local Ollama model
+MODEL_PROVIDER: Literal["gemini", "ollama"] = "gemini"   # Switch between cloud Gemini and a local Ollama model
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"   # LangChain Gemini model name
 OLLAMA_MODEL_NAME = "gpt-oss:120b-cloud"   # Local Ollama model name (must be pulled beforehand)
 OLLAMA_BASE_URL = "http://localhost:11434"   # Local Ollama server URL
@@ -29,12 +29,12 @@ OLLAMA_BASE_URL = "http://localhost:11434"   # Local Ollama server URL
 # % missing values for city / country / dob on TRUE vs FALSE alerts.
 # "client_*" = the client's data, "hit_*" = the screening hit's data.
 MISSING_RATE_CONFIG = {
-    "client_city":    {"true": 0.12, "false": 0.00},
-    "client_country": {"true": 0.07, "false": 0.00},
-    "hit_city":       {"true": 0.22, "false": 0.00},
-    "hit_country":    {"true": 0.12, "false": 0.00},
-    "client_dob":     {"true": 0.02, "false": 0.00},
-    "hit_dob":        {"true": 0.03, "false": 0.00},
+    "client_city":    {"true": 0.12, "false": 0.60},
+    "client_country": {"true": 0.47, "false": 0.40},
+    "hit_city":       {"true": 0.22, "false": 0.50},
+    "hit_country":    {"true": 0.12, "false": 0.60},
+    "client_dob":     {"true": 0.50, "false": 0.50},
+    "hit_dob":        {"true": 0.50, "false": 0.50},
 }
 
 # --- Enums & Schemas ---
@@ -300,7 +300,229 @@ def print_matching_text_qa(records: List[dict]) -> None:
         print(f"Matching-text QA complete: {issues} token(s) untraced (warnings only).")
 
 
-def generate_batch(batch_size: int, target_true_ratio: float, missing_config: dict = MISSING_RATE_CONFIG) -> List[dict]:
+class BatchGenerationError(RuntimeError):
+    """Raised when a batch cannot be produced in a schema-valid form after all repairs/retries."""
+
+
+def _extract_json_payload(text: str) -> Optional[str]:
+    """Extract the JSON object or array from a raw model completion.
+
+    Handles markdown fences, reasoning preamble, and trailing prose by scanning
+    balanced braces/brackets rather than trusting the full string to be JSON.
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    start = candidate.find("{")
+    array_start = candidate.find("[")
+    if start != -1 and (array_start == -1 or start < array_start):
+        open_ch, close_ch = "{", "}"
+        idx = start
+    elif array_start != -1:
+        open_ch, close_ch = "[", "]"
+        idx = array_start
+    else:
+        return None
+    depth = 0
+    in_str = False
+    i = idx
+    while i < len(candidate):
+        ch = candidate[i]
+        if in_str:
+            if ch == "\\" and i + 1 < len(candidate):
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+        if depth == 0:
+            return candidate[idx : i + 1]
+        i += 1
+    return None
+
+
+def _coerce_bool(value) -> Optional[bool]:
+    """Coerce a model decision value to bool, or None if unparseable."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("true", "t", "yes", "y", "1"):
+            return True
+        if s in ("false", "f", "no", "n", "0"):
+            return False
+    return None
+
+
+_TRUE_REASONS = {
+    "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH",
+    "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH",
+    "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING",
+}
+_FALSE_REASONS = {"NAME_MISMATCH", "DOB_MISMATCH_OR_INVALID", "GEOGRAPHIC_MISMATCH"}
+
+
+def _repair_alert(raw: dict) -> dict:
+    """Coerce one raw model alert into a clean dict that Pydantic strictly accepts."""
+    # Only keep keys the schema knows, so extra='forbid' never fails.
+    known = {
+        "client_name", "hit_name", "matching_text",
+        "client_dob", "hit_dob", "client_country", "client_city",
+        "hit_country", "hit_city", "decision", "decision_reason", "thinking",
+    }
+    cleaned = {k: raw[k] for k in raw if k in known}
+
+    for field in ("client_name", "hit_name", "matching_text", "client_dob", "hit_dob",
+                  "client_country", "client_city", "hit_country", "hit_city", "thinking"):
+        if cleaned.get(field) is None:
+            cleaned[field] = ""
+        elif not isinstance(cleaned[field], str):
+            cleaned[field] = str(cleaned[field])
+
+    # decision: coerce; default from reason when missing.
+    decision = _coerce_bool(cleaned.get("decision"))
+    if decision is None:
+        reason = str(cleaned.get("decision_reason") or "")
+        decision = reason in _TRUE_REASONS and reason not in _FALSE_REASONS
+    cleaned["decision"] = decision
+
+    # decision_reason: default / fix per decision.
+    reason = str(cleaned.get("decision_reason") or "").strip()
+    if not reason:
+        reason = "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH" if decision else "NAME_MISMATCH"
+    if decision and reason not in _TRUE_REASONS:
+        reason = "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH"
+    if not decision and reason not in _FALSE_REASONS:
+        reason = "NAME_MISMATCH"
+    cleaned["decision_reason"] = reason
+
+    # matching_text: synthesize from the first shared token if the model left it blank.
+    mt = str(cleaned.get("matching_text") or "").strip()
+    if not mt:
+        client_tokens = set(_normalized_tokens(cleaned.get("client_name") or ""))
+        hit_tokens = set(_normalized_tokens(cleaned.get("hit_name") or ""))
+        shared = client_tokens & hit_tokens
+        if shared:
+            mt = " | ".join(f"{t} ~ {t.upper()}" for t in sorted(shared)[:2])
+    cleaned["matching_text"] = mt
+
+    if not cleaned.get("thinking"):
+        cleaned["thinking"] = "Auto-repaired record: generated by screening-engine synthesis."
+
+    return cleaned
+
+
+def _repair_alerts(raw_payload: object) -> List[dict]:
+    """Coerce a raw model payload (dict/{"alerts":[...]}/[...]) into clean alert dicts."""
+    if not isinstance(raw_payload, dict):
+        raw_alerts = raw_payload
+    else:
+        if isinstance(raw_payload.get("alerts"), list):
+            raw_alerts = raw_payload["alerts"]
+        else:
+            list_values = [v for v in raw_payload.values() if isinstance(v, list)]
+            if list_values:
+                raw_alerts = list_values[0]
+            else:
+                raw_alerts = [raw_payload]
+    if isinstance(raw_alerts, dict):
+        raw_alerts = [raw_alerts]
+    if not isinstance(raw_alerts, list):
+        raise ValueError(f"Expected a list/dict alert payload, got {type(raw_alerts).__name__}.")
+    return [_repair_alert(item) for item in raw_alerts if isinstance(item, dict)]
+def _validate_alerts(cleaned: List[dict]) -> List[dict]:
+    """Strictly validate cleaned alert dicts via Pydantic; raises on failure."""
+    if not cleaned:
+        raise ValueError("No valid alert objects recovered from model output.")
+    batch = AlertDatasetBatch.model_validate({"alerts": cleaned})
+    return [alert.model_dump() for alert in batch.alerts]
+
+
+def _synthesize_missing_text_from_error(error: BaseException) -> str:
+    """Build a compact, actionable repair hint string from a Pydantic validation error."""
+    lines = []
+    if hasattr(error, "errors"):
+        for err in error.errors():
+            loc = ".".join(str(part) for part in err.get("loc", ()))
+            msg = err.get("msg", "")
+            lines.append(f"- {loc}: {msg}")
+    return "\n".join(lines[:12])
+
+
+def _invoke_batch_with_repair(llm, prompt: str, max_retries: int = 1) -> List[dict]:
+    """Run the model with structured-output; on parse failure, repair/validate the raw text.
+
+    Preferred path: `with_structured_output(schema, include_raw=True)` so a parse
+    miss puts a `raw` message + `parsing_error` in the result instead of raising.
+    Falls back to plain `.invoke()` for providers/methods whose servers reject the
+    structured format request.
+    """
+    structured_llm = llm.with_structured_output(
+        AlertDatasetBatch, include_raw=True, method="json_schema"
+    )
+
+    def _extract_raw(out) -> str:
+        if isinstance(out, dict):
+            raw = out.get("raw")
+            try:
+                return raw.content if hasattr(raw, "content") else str(raw or "")
+            except Exception:
+                return str(out) if "raw" not in out else str(raw)
+        return str(out)
+
+    last_error = None
+    raw_text = ""
+    for attempt in range(max_retries + 1):
+        # 1st try: structured path (raw + parsing_error), never raising on parse.
+        out = structured_llm.invoke(prompt)
+        parsing_error = out.get("parsing_error") if isinstance(out, dict) else None
+        raw_text = _extract_raw(out) or ""
+        if parsing_error is None:
+            parsed = out.get("parsed")
+            if isinstance(parsed, AlertDatasetBatch):
+                return [alert.model_dump() for alert in parsed.alerts]
+        # Fall back to repair+validate on the raw completion text.
+        payload_src = _extract_json_payload(raw_text)
+        if payload_src is not None:
+            try:
+                repaired = _repair_alerts(json.loads(payload_src))
+                return _validate_alerts(repaired)
+            except Exception as repair_err:
+                last_error = repair_err
+        else:
+            last_error = parsing_error or ValueError("No JSON payload found in model output.")
+        # Self-correction retry: append the parse feedback and ask again.
+        if attempt >= max_retries:
+            break
+        fix_hint = _synthesize_missing_text_from_error(last_error) or str(last_error)
+        prompt += (
+            "\n\n<repair_instructions>\n"
+            "Your previous response failed schema validation. "
+            f"Fix these specific issues and resend the complete valid JSON only:\n{fix_hint}\n"
+            "- Use EXACTLY the schema keys, no extras.\n"
+            "- Include exactly the requested number of alert objects, ALL fields populated"
+            " (no missing `matching_text` or `thinking`).\n"
+            "</repair_instructions>"
+        )
+    if not raw_text:
+        last_error = last_error or ValueError("Model returned empty output.")
+    raise BatchGenerationError(f"Batch generation failed after repairs: {last_error}")
+
+
+def generate_batch(
+    batch_size: int,
+    target_true_ratio: float,
+    missing_config: dict = MISSING_RATE_CONFIG,
+) -> List[dict]:
     batch_true_count = round(batch_size * target_true_ratio)
     batch_false_count = batch_size - batch_true_count
     missing_quotas_section = _build_missing_quotas(batch_true_count, batch_false_count, missing_config)
@@ -405,18 +627,16 @@ When evaluating each record, follow this exact sequence and document your evalua
         )
     else:
         raise ValueError(f"Unsupported MODEL_PROVIDER: {MODEL_PROVIDER!r}. Expected 'gemini' or 'ollama'.")
-    structured_llm = llm.with_structured_output(AlertDatasetBatch)
-    
-    # Invoke the model directly; LangChain handles parsing into the Pydantic object
-    validated_batch = structured_llm.invoke(prompt)
-    
-    return [alert.model_dump() for alert in validated_batch.alerts]
+
+    # Invoke the model; structured output with tolerant repair on parse failure
+    return _invoke_batch_with_repair(llm, prompt)
 
 def main():
     total_calls = math.ceil(TOTAL_ROWS / ROWS_PER_CALL)
     global_true_ratio = TOTAL_TRUE_ALERTS / TOTAL_ROWS
     master_dataset: List[dict] = []
-    
+    successful_calls = 0
+
     print(f"Starting batch generation: Target = {TOTAL_ROWS} rows (True: {TOTAL_TRUE_ALERTS}, False: {TOTAL_FALSE_ALERTS}) | Batch Size = {ROWS_PER_CALL} | Total Calls = {total_calls}")
     
     for current_call in range(1, total_calls + 1):
@@ -428,18 +648,26 @@ def main():
 
         try:
             batch_records = generate_batch(current_batch_size, global_true_ratio)
+            if not batch_records:
+                raise ValueError("generate_batch returned an empty alert list.")
             batch_records = enforce_missing_rates(batch_records)
             master_dataset.extend(batch_records)
+            successful_calls += 1
             completed_pct = (len(master_dataset) / TOTAL_ROWS) * 100
             print(f"Progress: {len(master_dataset)}/{TOTAL_ROWS} records ({completed_pct:.1f}%)")
         except Exception as e:
-            print(f"Error on call {current_call}: {e}. Retrying iteration...")
+            print(f"Error on call {current_call}: {e}. Skipping iteration...")
             continue
 
     # Enforce exact global missing-rate targets on the compiled dataset, then QA.
     enforce_missing_rates(master_dataset)
     print_missing_qa(master_dataset)
     print_matching_text_qa(master_dataset)
+
+    if not master_dataset:
+        print(f"No records were generated (all {total_calls} batch calls failed).")
+        print("Refusing to overwrite compliance_master_dataset.xlsx with an empty dataset.")
+        return
 
     # Export to Excel
     output_filename = "compliance_master_dataset.xlsx"
@@ -448,7 +676,9 @@ def main():
         
     actual_true = sum(1 for r in master_dataset if r['decision'] is True)
     actual_false = sum(1 for r in master_dataset if r['decision'] is False)
-    print(f"Generation complete. Compiled {len(master_dataset)} records (True: {actual_true}, False: {actual_false}) into Excel file: {output_filename}.")
+    print(f"Generation complete. Compiled {len(master_dataset)} records (True: {actual_true}, False: {actual_false}) "
+          f"into Excel file: {output_filename}. ({successful_calls}/{total_calls} batch calls succeeded, "
+          f"{total_calls - successful_calls} skipped).")
 
 if __name__ == "__main__":
     main()
