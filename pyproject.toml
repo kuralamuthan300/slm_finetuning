@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "langchain-google-genai>=4.3.7",
+    "langchain-ollama>=0.3.0",
     "ollama>=0.6.2",
     "openpyxl>=3.1.5",
     "pandas>=3.0.5",

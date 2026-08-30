@@ -6,6 +6,7 @@ from typing import List, Optional, Literal
 from pydantic import BaseModel, Field, ConfigDict
 import pandas as pd
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,7 +16,12 @@ TOTAL_TRUE_ALERTS = 40 # Target total number of TRUE alerts required
 TOTAL_FALSE_ALERTS = 100 # Target total number of FALSE alerts required
 TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
 ROWS_PER_CALL = 10      # Number of rows generated per LLM call
-MODEL_NAME = "gemini-3.5-flash-lite"   # LangChain Gemini model name
+
+# --- LLM Provider Configuration ---
+MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud Gemini and a local Ollama model
+GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"   # LangChain Gemini model name
+OLLAMA_MODEL_NAME = "gpt-oss:120b-cloud"   # Local Ollama model name (must be pulled beforehand)
+OLLAMA_BASE_URL = "http://localhost:11434"   # Local Ollama server URL
 
 # --- Missing-value configuration ---
 # Target fraction of records where each field must be empty (None), split
@@ -294,7 +300,7 @@ def print_matching_text_qa(records: List[dict]) -> None:
         print(f"Matching-text QA complete: {issues} token(s) untraced (warnings only).")
 
 
-def generate_batch(batch_size: int, target_true_ratio: float, model_name: str, missing_config: dict = MISSING_RATE_CONFIG) -> List[dict]:
+def generate_batch(batch_size: int, target_true_ratio: float, missing_config: dict = MISSING_RATE_CONFIG) -> List[dict]:
     batch_true_count = round(batch_size * target_true_ratio)
     batch_false_count = batch_size - batch_true_count
     missing_quotas_section = _build_missing_quotas(batch_true_count, batch_false_count, missing_config)
@@ -337,55 +343,29 @@ For this specific batch, aim for approximately {batch_true_count} TRUE alerts an
 <false_name_match_scenarios>
 The engine fires on fuzzy token similarity, so FALSE name matches mirror the exact false-positive families a real screening engine produces. Study these families and sample across ALL of them over the generation lifecycle:
 
-Family A - Common-name over-match:
-- client `Smith, Jane Adelaide` / hit `SMITH, Robert` / matching_text `"Smith ~ SMITH"` - shared extremely common surname, different people -> `NAME_MISMATCH`
-- client `Mohammed, Ali Hassan` / hit `ALI, Batyr` / matching_text `"Ali ~ ALI"` - single common given name over-fires
-- client `Ho, Wei Ming` / hit `HO CHI MINH` / matching_text `"Ho ~ HO"` - two-letter surname over-fires on a famous namesake
+Family A - Common-name over-match: a shared extremely common surname or given name over-fires on unrelated people.
 
-Family B - Phonetic / spelling variants:
-- client `Smyth, James` / hit `SMITH, James` / matching_text `"Smyth ~ SMITH"` - spelled differently, pronounced alike, unrelated people
-- client `Yusuf, Daud` / hit `YOUSEF, Daoud` / matching_text `"Yusuf ~ YOUSEF"` - transliteration variants of a common Arabic name
-- client `Müller, Hans` / hit `MUELLER, Josef` / matching_text `"Müller ~ MUELLER"` - umlaut-expanded surname, different people
+Family B - Phonetic / spelling variants: names spelled differently but pronounced alike belong to unrelated people.
 
-Family C - Transliteration across scripts:
-- client `Usama, Rashid` / hit `USSAMA, Osama` / matching_text `"Usama ~ USSAMA"` - romanized Arabic variants
-- client `Petrov, Dmitri` / hit `ДМИТРИЙ ПЕТРОВ` / matching_text `"Petrov ~ ПЕТРОВ"` - Latin vs Cyrillic forms
-- client `Wong, Li Wei` / hit `WONG, Wei` / matching_text `"Wong ~ WONG | Wei ~ Wei"` - romanized CJK surname+given over-fire
+Family C - Transliteration across scripts: romanized or cross-script (e.g. Latin vs Cyrillic vs CJK) forms of a name over-fire.
 
-Family D - Diacritics / accent stripped:
-- client `García, Ana María` / hit `GARCIA, Luis` / matching_text `"García ~ GARCIA"` - accent dropped at match time
-- client `Weiß, Kurt` / hit `WEISS, Petra` / matching_text `"Weiß ~ WEISS"` - sharp-s vs ss
+Family D - Diacritics / accent stripped: accents or special characters dropped at match time create an over-fire.
 
-Family E - Abbreviations / initials expanded:
-- client `Smith, J. R.` / hit `SMITH, JOHN ROBERT` / matching_text `"Smith, J. R. ~ SMITH, JOHN ROBERT"` - surname + initials match the expanded hit
-- client `de la Torre, F.` / hit `TORRE, FERNANDO` / matching_text `"de la Torre, F. ~ TORRE, FERNANDO"` - particle + initial over-matches
+Family E - Abbreviations / initials expanded: surname plus initials over-matches an expanded full-name hit.
 
-Family F - Token-order permutation:
-- client `Haddad, Karim` / hit `KARIM HADDAD` / matching_text `"Haddad, Karim ~ KARIM HADDAD"` - order-insensitive name index fires
-- client `Garcia Lopez, Maria` / hit `LOPEZ GARCIA, Carlos` / matching_text `"Garcia ~ GARCIA | Lopez ~ LOPEZ"` - both surnames shared in reordered form
+Family F - Token-order permutation: an order-insensitive name index fires on reordered or swapped name tokens.
 
-Family G - Partial / compound-name substring:
-- client `Ahmadinejad, Reza` / hit `AHMAD, Reza` / matching_text `"Ahmad ~ AHMAD"` - leading substring of a longer surname trips the engine
-- client `Cruz-Ramirez, Elena` / hit `RAMIREZ, Jorge` / matching_text `"Ramirez ~ RAMIREZ"` - hyphenated compound shares one surname token
+Family G - Partial / compound-name substring: a substring of a longer or hyphenated compound surname trips the engine.
 
-Family H - Maiden / married / apostrophe-split surnames:
-- client `Lopez, Rosa` (maiden Garcia-Lopez) / hit `GARCIA, Rosa` / matching_text `"Rosa ~ ROSA"` - shared wrapper given name + linked surnames
-- client `O'Brien, Siobhan` / hit `BRIEN, Michael` / matching_text `"Brien ~ BRIEN"` - apostrophe-split surname over-fires
+Family H - Maiden / married / apostrophe-split surnames: linked or split surname forms over-fire on a shared given name or surname fragment.
 
-Family I - Nicknames & cross-lingual given-name equivalences:
-- client `Alejandro, Miguel` / hit `ALEX, Miguel` / matching_text `"Miguel ~ MIGUEL"` - same given name, different people
-- client `John, Robert` / hit `IVAN, Robert` / matching_text `"Robert ~ ROBERT"` - cross-lingual synonyms (John/Ivan) are NOT matches but the shared second name fires
+Family I - Nicknames & cross-lingual given-name equivalences: a shared given name (or cross-lingual synonym) over-fires on unrelated people.
 
-Family J - Asian name-order / structure confusion:
-- client `Kim, Jong Il` / hit `JONG IL KIM` / matching_text `"Kim, Jong Il ~ JONG IL KIM"` - the engine reorders tokens and normalizes structure
-- client `Nguyen, Van Anh` / hit `ANH, NGUYEN` / matching_text `"Nguyen ~ NGUYEN | Van Anh ~ ANH"` - swapped surname/given pairs over-fire
+Family J - Asian name-order / structure confusion: the engine reorders or normalizes surname/given-name structure and over-fires.
 
-Family K - Generation markers stripped:
-- client `Ford, Harrison, Jr.` / hit `FORD, HARRISON, III` / matching_text `"Ford, Harrison ~ FORD, HARRISON"` - Jr/III stripped, still a different person
+Family K - Generation markers stripped: Jr/Sr/III suffixes are stripped, matching a different person of the same base name.
 
-Family L - Articles / connectives / prefixes normalized away:
-- client `Al-Assad, Bashar` / hit `ASSAD, Batyr` / matching_text `"Al-Assad ~ ASSAD"` - Al-/El-/bin/ibn prefixes removed at match time
-- client `van der Berg, Jan` / hit `BERG, Klaus` / matching_text `"Berg ~ BERG"` - `van der` connective dropped
+Family L - Articles / connectives / prefixes normalized away: particles like Al-/El-/bin/ibn/van der are dropped at match time, over-firing on an unrelated person.
 </false_name_match_scenarios>
 
 <cascading_logic>
@@ -410,12 +390,21 @@ When evaluating each record, follow this exact sequence and document your evalua
 </constraints>
 """
     
-    # Initialize the LangChain Google GenAI model with structured output enforcement
-    llm = ChatGoogleGenerativeAI(
-    model=model_name, 
-    temperature=0.7, 
-    google_api_key=os.getenv("GOOGLE_API_KEY")
-    )
+    # Initialize the configured LangChain chat model with structured output enforcement
+    if MODEL_PROVIDER == "gemini":
+        llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL_NAME,
+            temperature=0.7,
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+        )
+    elif MODEL_PROVIDER == "ollama":
+        llm = ChatOllama(
+            model=OLLAMA_MODEL_NAME,
+            base_url=OLLAMA_BASE_URL,
+            temperature=0.7,
+        )
+    else:
+        raise ValueError(f"Unsupported MODEL_PROVIDER: {MODEL_PROVIDER!r}. Expected 'gemini' or 'ollama'.")
     structured_llm = llm.with_structured_output(AlertDatasetBatch)
     
     # Invoke the model directly; LangChain handles parsing into the Pydantic object
@@ -438,7 +427,7 @@ def main():
             break
 
         try:
-            batch_records = generate_batch(current_batch_size, global_true_ratio, MODEL_NAME)
+            batch_records = generate_batch(current_batch_size, global_true_ratio)
             batch_records = enforce_missing_rates(batch_records)
             master_dataset.extend(batch_records)
             completed_pct = (len(master_dataset) / TOTAL_ROWS) * 100
