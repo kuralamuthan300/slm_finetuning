@@ -6,24 +6,20 @@ import pandas as pd
 import ollama
 
 # --- Configuration Parameters ---
-TOTAL_TRUE_ALERTS = 600  # Target total number of TRUE alerts required
-TOTAL_FALSE_ALERTS = 400  # Target total number of FALSE alerts required
+TOTAL_TRUE_ALERTS = 60 # Target total number of TRUE alerts required
+TOTAL_FALSE_ALERTS = 40  # Target total number of FALSE alerts required
 TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
 ROWS_PER_CALL = 10      # Number of rows generated per LLM call
-MODEL_NAME = "deepseek-r1:1.5b"   # Local Ollama model name
+MODEL_NAME = "gemma4:31b-cloud"   # Local Ollama model name
 
 # --- Enums & Schemas ---
-ScreeningType = Literal["Sanctions", "Embargoes", "PEP", "RCA"]
-HitType = Literal["embargo", "non-embargo"]
 DecisionReason = Literal[
     "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH",
     "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH",
     "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING",
-    "EMBARGO_COUNTRY_MATCH",
     "NAME_MISMATCH",
     "DOB_MISMATCH_OR_INVALID",
     "GEOGRAPHIC_MISMATCH",
-    "EMBARGO_WILDCARD_HIT"
 ]
 
 class AlertRecord(BaseModel):
@@ -37,8 +33,6 @@ class AlertRecord(BaseModel):
     client_city: Optional[str] = None
     hit_country: Optional[str] = None
     hit_city: Optional[str] = None
-    screening_type: ScreeningType
-    hit_type: HitType
     decision: bool
     decision_reason: DecisionReason
     thinking: str
@@ -53,7 +47,7 @@ def generate_batch(batch_size: int, target_true_ratio: float, model_name: str) -
 
     prompt = f"""
 <system>
-You are an expert compliance data engineer and data synthesis specialist. Generate a realistic, high-fidelity synthetic dataset of exactly {batch_size} alerts originating from a financial crime screening engine (Sanctions, Embargoes, PEPs, RCAs).
+You are an expert compliance data engineer and data synthesis specialist. Generate a realistic, high-fidelity synthetic dataset of exactly {batch_size} alerts originating from a financial crime screening engine (Sanctions, PEPs, RCAs).
 For this specific batch, aim for approximately {batch_true_count} TRUE alerts and {batch_false_count} FALSE alerts.
 </system>
 
@@ -64,70 +58,41 @@ Return a JSON object containing an "alerts" array with precisely {batch_size} ob
 <naming_convention>
 - `client_name` strictly follows the format: `Lastname, Middlename, Firstname` (or `Lastname, Firstname` if middle name is absent).
 - `hit_name` may or may not follow this format.
-- Strict Matching Rule: Token or order mismatches (e.g., comparing `alexander, kumar` vs `kumar, alexander`) must be flagged as a strict mismatch (`decision: false`, `decision_reason: "NAME_MISMATCH"`).
+- Go crazy with name matches for BOTH false and true alerts. Vary how `client_name` and `hit_name` relate to each other across records: exact repeats, token-order swaps, partial/fuzzy matches, initials or abbreviations, added/omitted middle names, maiden vs married surnames, aliases and known-as names, transliterations across scripts, hyphenated and multi-part surnames (e.g., "de la Cruz" vs "dela Cruz"), and near-miss typo variants that produce `NAME_MISMATCH` false alerts — alongside legitimate close variations that still count as TRUE matches.
+- Also go crazy with formats: mix native scripts and diacritics, uppercase/lowercase/mixed-case, title prefixes (Mr., Dr., Sheikh, etc.), extra or missing middle components, and inconsistent spacing, punctuation, and capitalization across records.
 </naming_convention>
 
 <dob_logic>
 - Since the DOB difference of < 1 year is acceptable for true alerts, dates do not need to be identical always. Minor offsets, day/month swaps, or formatting differences resulting in a delta under 1 year are valid for true alerts.
-- Only a clear major disparity ($\ge 1$ year difference) triggers a DOB mismatch failure (`decision: false`, `decision_reason: "DOB_MISMATCH_OR_INVALID"`).
+- Only a clear major disparity ($\\ge 1$ year difference) triggers a DOB mismatch failure (`decision: false`, `decision_reason: "DOB_MISMATCH_OR_INVALID"`).
 - Completely missing, invalid, or unparsable values gracefully bypass DOB checks to proceed down the cascade.
+- Go crazy with DOB formats for BOTH `client_dob` and `hit_dob`. Vary representation across records: ISO (`YYYY-MM-DD`), day-first (`DD-MM-YYYY`), US (`MM/DD/YYYY`), dotted (`DD.MM.YYYY`), slash/two-digit years (`15/04/82`), written English (`12 April 1982`, `Apr 12, 1982`), ordinal forms (`12th April 1982`), month-year or year-only partials (`April 1982`, `1982`), age-style values (`43 yrs`), and `circa`/approximate markers (`circa 1982`).
+- Keep the format chaos decision-safe: the same calendar date expressed in different layouts must still resolve correctly (matching date in different formats -> true-compatible; real year gaps >= 1 year -> `DOB_MISMATCH_OR_INVALID`; unparsable/partial -> graceful bypass).
 </dob_logic>
+
+<city_country_logic>
+- `client_country`/`client_city` and `hit_country`/`hit_city` capture the geography associated with the client and the screening hit. A location can be expressed at country and/or city granularity.
+- Go crazy with city/country formats for BOTH client and hit geography. Vary representation across records: native/local scripts and diacritics (e.g., `Москва` vs `Moscow`), endonyms vs exonyms (`München` vs `Munich`), country aliases (`USA` vs `United States` vs `U.S.A.`), historical or alternate city names (`Mumbai` vs `Bombay`, `Saint Petersburg` vs `St. Petersburg`), ISO-style codes, mixed case and inconsistent capitalization, and city-plus-region/country suffixes (`Paris, FR`, `Dubai, AE`).
+- Keep the format chaos decision-safe: the same place expressed in different spellings or layouts is still a geographic MATCH; a genuinely different country or city -> `decision: false`, `decision_reason: "GEOGRAPHIC_MISMATCH"`. Missing or invalid values bypass geography per Step 2 of `<cascading_logic>` (note it briefly in `thinking` and proceed, do not fail).
+</city_country_logic>
 
 <cascading_logic>
 When evaluating each record, follow this exact sequence and document your evaluation in the `thinking` field in **1-2 short, crisp sentences**:
-1. Embargo Check: If `hit_type` is "embargo" (where `hit_name` is "*"), check if `client_country` or `client_city` matches `hit_country`. 
-   - Match -> decision: true, decision_reason: "EMBARGO_COUNTRY_MATCH".
-   - No match/missing -> decision: false, decision_reason: "EMBARGO_WILDCARD_HIT". Skip name checks.
-2. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2.
-3. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3.
-4. Step 3 (Name): Check `client_name` vs `hit_name` accounting for formatting and strict token order. 
+1. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2.
+2. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3.
+3. Step 3 (Name): Check `client_name` vs `hit_name` accounting for formatting and strict token order. 
    - Exact structured match -> use available valid elements for a true decision with code (`EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH`, `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`, or `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`).
    - Mismatch or reverse order -> decision: false, decision_reason: "NAME_MISMATCH".
 </cascading_logic>
 
 <constraints>
-- Allowed True Reasons: "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING", "EMBARGO_COUNTRY_MATCH"
-- Allowed False Reasons: "NAME_MISMATCH", "DOB_MISMATCH_OR_INVALID", "GEOGRAPHIC_MISMATCH", "EMBARGO_WILDCARD_HIT"
+- Allowed True Reasons: "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING"
+- Allowed False Reasons: "NAME_MISMATCH", "DOB_MISMATCH_OR_INVALID", "GEOGRAPHIC_MISMATCH"
 - Demographics: Sample diversely across global backgrounds over your generation lifecycle.
 - Native Scripts & Data Quality: Include native characters/diacritics where appropriate and realistic dirty data.
 - Thinking Field Style: Keep `thinking` values punchy, concise, and professional (1-2 sentences max).
 </constraints>
 
-<few_shot_examples>
-Example 1 (True Match with minor DOB variance < 1 year):
-{{
-  "client_name": "Moreau, Jean-Luc",
-  "hit_name": "Moreau, Jean-Luc",
-  "client_dob": "1982-04-12",
-  "hit_dob": "1982-04-15",
-  "client_country": "France",
-  "client_city": "Paris",
-  "hit_country": "France",
-  "hit_city": "Paris",
-  "screening_type": "Sanctions",
-  "hit_type": "non-embargo",
-  "decision": true,
-  "decision_reason": "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH",
-  "thinking": "Exact name match with acceptable DOB variance (< 1 year) and matching geography."
-}}
-
-Example 2 (Name Mismatch due to order):
-{{
-  "client_name": "Kumar, Alexander",
-  "hit_name": "Alexander, Kumar",
-  "client_dob": "1990-01-01",
-  "hit_dob": "1990-01-01",
-  "client_country": "India",
-  "client_city": "Bengaluru",
-  "hit_country": "India",
-  "hit_city": "Bengaluru",
-  "screening_type": "PEP",
-  "hit_type": "non-embargo",
-  "decision": false,
-  "decision_reason": "NAME_MISMATCH",
-  "thinking": "Token order mismatch between names (Kumar, Alexander vs Alexander, Kumar)."
-}}
-</few_shot_examples>
 """
     
     response = ollama.chat(
