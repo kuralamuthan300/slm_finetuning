@@ -12,15 +12,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Configuration Parameters ---
-TOTAL_TRUE_ALERTS = 40 # Target total number of TRUE alerts required
-TOTAL_FALSE_ALERTS = 100 # Target total number of FALSE alerts required
+TOTAL_TRUE_ALERTS = 200 # Target total number of TRUE alerts required
+TOTAL_FALSE_ALERTS = 800 # Target total number of FALSE alerts required
 TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
-ROWS_PER_CALL = 10      # Number of rows generated per LLM call
+ROWS_PER_CALL = 25      # Number of rows generated per LLM call
 
 # --- LLM Provider Configuration ---
-MODEL_PROVIDER: Literal["gemini", "ollama"] = "gemini"   # Switch between cloud Gemini and a local Ollama model
+MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud Gemini and a local Ollama model
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"   # LangChain Gemini model name
-OLLAMA_MODEL_NAME = "gpt-oss:120b-cloud"   # Local Ollama model name (must be pulled beforehand)
+OLLAMA_MODEL_NAME = "gemma4:31b-cloud"   # Local Ollama model name (must be pulled beforehand)
 OLLAMA_BASE_URL = "http://localhost:11434"   # Local Ollama server URL
 
 # --- Missing-value configuration ---
@@ -529,74 +529,71 @@ def generate_batch(
 
     prompt = f"""
 <system>
-You are an expert compliance data engineer and data synthesis specialist. Generate a realistic, high-fidelity synthetic dataset of exactly {batch_size} alerts originating from a financial crime screening engine (Sanctions, PEPs, RCAs).
+You are an expert compliance client alert review analyst and data synthesis specialist. Generate a realistic, high-fidelity synthetic dataset of exactly {batch_size} alerts originating from a financial crime screening engine (Sanctions, PEPs, RCAs). 
+
+This dataset will be used to fine-tune and train a pretrained LLM. Therefore, the data distribution, global demographic representativeness, formatting chaos, and step-by-step reasoning must perfectly mirror the cognitive process and edge cases handled by a real-world human analyst.
+
+CRITICAL COMPLIANCE DIRECTIVES:
+1. **Human-Only Focus:** All `client_*` and `hit_*` entities are strictly human individuals (no corporate entities, shell companies, or trusts).
+2. **Avoid Type II Errors (False Negatives):** Legitimate identity variations (such as cultural name inversions, maiden/married names, cross-lingual aliases, dropped prefixes, and diacritic normalization) are **valid matches** that require human investigation, not automatic dismissals. False name mismatches (`NAME_MISMATCH`) must *only* be triggered when comparing genuinely distinct individuals who share accidental commonalities.
+3. **EU AI Act Article 10 Alignment:** Ensure the dataset is globally representative across diverse cultures, linguistic backgrounds, scripts, and naming customs to prevent proxy bias or demographic discrimination.
+
 For this specific batch, aim for approximately {batch_true_count} TRUE alerts and {batch_false_count} FALSE alerts.
 </system>
 
+<persona_context>
+- `client_*` fields represent human retail banking customers and wealth management clients globally, reflecting diverse international demographics, age groups, and socioeconomic backgrounds.
+- `hit_*` fields represent human individuals found on high-risk watchlists: Politically Exposed Persons (PEPs), sanctioned individuals, or financial criminals, featuring diverse global origins and titles (e.g., political, military, or religious honorifics where culturally appropriate) without skewing risk solely to specific regions.
+</persona_context>
+
 <naming_convention>
-- `client_name` strictly follows the format: `Lastname, Middlename, Firstname` (or `Lastname, Firstname` if middle name is absent).
-- `hit_name` may or may not follow this format.
-- Go crazy with name matches for BOTH false and true alerts. Vary how `client_name` and `hit_name` relate to each other across records: exact repeats, token-order swaps, partial/fuzzy matches, initials or abbreviations, added/omitted middle names, maiden vs married surnames, aliases and known-as names, transliterations across scripts, hyphenated and multi-part surnames (e.g., "de la Cruz" vs "dela Cruz"), and near-miss typo variants that produce `NAME_MISMATCH` false alerts — alongside legitimate close variations that still count as TRUE matches.
-- Also go crazy with formats: mix native scripts and diacritics, uppercase/lowercase/mixed-case, title prefixes (Mr., Dr., Sheikh, etc.), extra or missing middle components, and inconsistent spacing, punctuation, and capitalization across records.
+- `client_name` and `hit_name` must reflect realistic global naming customs for individuals (e.g., Western last/first structures, patronymics, matronymics, mononyms, multi-part surnames, and localized name orders). Do not force all human names into a rigid Western template.
+- Go crazy with name formats across records: mix native scripts and diacritics, uppercase/lowercase/mixed-case, title prefixes, extra or missing middle components, and inconsistent spacing, punctuation, and capitalization.
+- Ensure true alerts leverage realistic variations (diacritic normalization, standard initial expansions, common aliases, or cultural structures) without failing name logic, while false `NAME_MISMATCH` alerts leverage the specific distinct-person collision families below.
 </naming_convention>
 
 <dob_logic>
 - Since the DOB difference of < 1 year is acceptable for true alerts, dates do not need to be identical always. Minor offsets, day/month swaps, or formatting differences resulting in a delta under 1 year are valid for true alerts.
-- Only a clear major disparity ($\\ge 1$ year difference) triggers a DOB mismatch failure (`decision: false`, `decision_reason: "DOB_MISMATCH_OR_INVALID"`).
+- Only a clear major disparity (\\ge 1 year difference) triggers a DOB mismatch failure (`decision: false`, `decision_reason: "DOB_MISMATCH_OR_INVALID"`).
 - Completely missing, invalid, or unparsable values gracefully bypass DOB checks to proceed down the cascade.
 - Go crazy with DOB formats for BOTH `client_dob` and `hit_dob`. Vary representation across records: ISO (`YYYY-MM-DD`), day-first (`DD-MM-YYYY`), US (`MM/DD/YYYY`), dotted (`DD.MM.YYYY`), slash/two-digit years (`15/04/82`), written English (`12 April 1982`, `Apr 12, 1982`), ordinal forms (`12th April 1982`), month-year or year-only partials (`April 1982`, `1982`), age-style values (`43 yrs`), and `circa`/approximate markers (`circa 1982`).
 - Keep the format chaos decision-safe: the same calendar date expressed in different layouts must still resolve correctly (matching date in different formats -> true-compatible; real year gaps >= 1 year -> `DOB_MISMATCH_OR_INVALID`; unparsable/partial -> graceful bypass).
 </dob_logic>
 
 <city_country_logic>
-- `client_country`/`client_city` and `hit_country`/`hit_city` capture the geography associated with the client and the screening hit. A location can be expressed at country and/or city granularity.
-- Go crazy with city/country formats for BOTH client and hit geography. Vary representation across records: native/local scripts and diacritics (e.g., `Москва` vs `Moscow`), endonyms vs exonyms (`München` vs `Munich`), country aliases (`USA` vs `United States` vs `U.S.A.`), historical or alternate city names (`Mumbai` vs `Bombay`, `Saint Petersburg` vs `St. Petersburg`), ISO-style codes, mixed case and inconsistent capitalization, and city-plus-region/country suffixes (`Paris, FR`, `Dubai, AE`).
+- `client_country`/`client_city` and `hit_country`/`hit_city` capture the geography associated with the human client and the screening hit. A location can be expressed at country and/or city granularity.
+- Go crazy with city/country formats for BOTH client and hit geography. Vary representation across records: native/local scripts and diacritics (e.g., `Москва` vs `Moscow`), endonyms vs exonyms (`München` vs `Munich`), country aliases (`USA` vs `United States` vs `U.S.A.`), historical or alternate city names (`Mumbai` vs `Bombay`), ISO-style codes, mixed case, and city-plus-region/country suffixes (`Paris, FR`).
 - Keep the format chaos decision-safe: the same place expressed in different spellings or layouts is still a geographic MATCH; a genuinely different country or city -> `decision: false`, `decision_reason: "GEOGRAPHIC_MISMATCH"`. Missing or invalid values bypass geography per Step 2 of `<cascading_logic>` (note it briefly in `thinking` and proceed, do not fail).
 </city_country_logic>
 
 <screening_engine_match_logic>
 - Every alert (TRUE and FALSE) MUST populate `matching_text`: the exact word(s)/token(s) that the screening engine matched when it fired the alert.
-- The engine does NOT know the verdict when it fires: it tokenizes and normalizes both names (strip titles/initials where applicable, split on spaces/commas/hyphens, lower-case, tolerate diacritics and phonetic variants) and stores the evidence that tripped a match.
+- The engine does NOT know the verdict when it fires: it tokenizes and normalizes both names and stores the evidence that tripped a match.
 - `matching_text` format: a compact token-pair list, one pair per fired token, written as `"<client_token> ~ <hit_token>"`, joined by ` | ` when the engine over-fires on several tokens (e.g. `"Garcia ~ GARCIA | Lopez ~ LOPEZ"`).
-- The tokens MUST be traceable to the names: the client-side token appears in `client_name` and the hit-side token appears in `hit_name` (allowing for case/diacritic/small-spelling variants and transliterations across scripts).
+- The tokens MUST be traceable to the names: the client-side token appears in `client_name` and the hit-side token appears in `hit_name`.
 - Even when later adjudicated FALSE (e.g. `NAME_MISMATCH`), `matching_text` must still state what fired the engine, since the analyst reviews it after the fact.
 </screening_engine_match_logic>
 
 <false_name_match_scenarios>
-The engine fires on fuzzy token similarity, so FALSE name matches mirror the exact false-positive families a real screening engine produces. Study these families and sample across ALL of them over the generation lifecycle:
+*Note: Unsafe evasion/normalization families (like maiden names, nicknames, prefix-stripping, and CJK inversions) have been intentionally excluded to prevent training the model to clear true risks.*
 
-Family A - Common-name over-match: a shared extremely common surname or given name over-fires on unrelated people.
+The engine fires on fuzzy token similarity. Use **only** these approved false-positive families for records resulting in `NAME_MISMATCH`:
 
-Family B - Phonetic / spelling variants: names spelled differently but pronounced alike belong to unrelated people.
-
-Family C - Transliteration across scripts: romanized or cross-script (e.g. Latin vs Cyrillic vs CJK) forms of a name over-fire.
-
-Family D - Diacritics / accent stripped: accents or special characters dropped at match time create an over-fire.
-
-Family E - Abbreviations / initials expanded: surname plus initials over-matches an expanded full-name hit.
-
-Family F - Token-order permutation: an order-insensitive name index fires on reordered or swapped name tokens.
-
-Family G - Partial / compound-name substring: a substring of a longer or hyphenated compound surname trips the engine.
-
-Family H - Maiden / married / apostrophe-split surnames: linked or split surname forms over-fire on a shared given name or surname fragment.
-
-Family I - Nicknames & cross-lingual given-name equivalences: a shared given name (or cross-lingual synonym) over-fires on unrelated people.
-
-Family J - Asian name-order / structure confusion: the engine reorders or normalizes surname/given-name structure and over-fires.
-
-Family K - Generation markers stripped: Jr/Sr/III suffixes are stripped, matching a different person of the same base name.
-
-Family L - Articles / connectives / prefixes normalized away: particles like Al-/El-/bin/ibn/van der are dropped at match time, over-firing on an unrelated person.
+Family A - Common-name over-match: a shared extremely common surname or given name over-fires on entirely unrelated people (e.g., John Smith vs. Arthur Smith).
+Family B - Phonetic / spelling variants of distinct people: names spelled similarly but belonging to completely different individuals.
+Family C - Transliteration across scripts for separate individuals: cross-script name collisions where the underlying entities are distinct.
+Family F - Token-order permutation of separate individuals: an order-insensitive index fires on swapped name components belonging to completely different people.
+Family G - Partial / compound-name substring over-fire: a shared surname fragment trips the engine on an unrelated compound-surname individual.
+Family K - Generation markers (Father vs. Son): Jr/Sr suffixes match separate legal entities who share a base name.
 </false_name_match_scenarios>
 
 <cascading_logic>
-When evaluating each record, follow this exact sequence and document your evaluation in the `thinking` field in **1-2 short, crisp sentences**:
+When evaluating each record, you MUST generate the `thinking` field FIRST before determining the final decision or reason. Follow this exact sequence and document your evaluation in `thinking` using **1-2 short, crisp sentences**:
 1. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2.
 2. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3.
 3. Step 3 (Name): Check `client_name` vs `hit_name` accounting for formatting and strict token order. 
-   - Exact structured match -> use available valid elements for a true decision with code (`EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH`, `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`, or `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`).
-   - Mismatch or reverse order -> decision: false, decision_reason: "NAME_MISMATCH".
+   - Exact structured match or valid identity variation (aliases, diacritic cleaning, initial expansion, cultural ordering variations) -> use available valid elements for a true decision with code (`EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH`, `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`, or `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`).
+   - Genuinely distinct individuals matching via an approved false-match family -> decision: false, decision_reason: "NAME_MISMATCH".
    - ALWAYS populate `matching_text` with the token(s) that fired the engine — even on FALSE `NAME_MISMATCH` verdicts.
 </cascading_logic>
 
@@ -605,7 +602,7 @@ When evaluating each record, follow this exact sequence and document your evalua
 <constraints>
 - Allowed True Reasons: "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING"
 - Allowed False Reasons: "NAME_MISMATCH", "DOB_MISMATCH_OR_INVALID", "GEOGRAPHIC_MISMATCH"
-- Demographics: Sample diversely across global backgrounds over your generation lifecycle.
+- Demographics: Sample diversely across global human backgrounds over your generation lifecycle.
 - Native Scripts & Data Quality: Include native characters/diacritics where appropriate and realistic dirty data.
 - `matching_text` is required on EVERY row (never empty, never "N/A"); it may hold a single token-pair or several pairs joined by ` | `.
 - Thinking Field Style: Keep `thinking` values punchy, concise, and professional (1-2 sentences max).
