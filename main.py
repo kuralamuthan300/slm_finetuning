@@ -2,6 +2,7 @@ import json
 import math
 import re
 import unicodedata
+from datetime import datetime
 from typing import List, Optional, Literal
 from pydantic import BaseModel, Field, ConfigDict
 import pandas as pd
@@ -22,6 +23,26 @@ MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud 
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"   # LangChain Gemini model name
 OLLAMA_MODEL_NAME = "gemma4:31b-cloud"   # Local Ollama model name (must be pulled beforehand)
 OLLAMA_BASE_URL = "http://localhost:11434"   # Local Ollama server URL
+
+
+def _sanitize_filename_component(value: str) -> str:
+    """Replace special characters with underscores for filename components."""
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
+    return sanitized or "model"
+
+
+def _configured_model_name() -> str:
+    if MODEL_PROVIDER == "gemini":
+        return GEMINI_MODEL_NAME
+    if MODEL_PROVIDER == "ollama":
+        return OLLAMA_MODEL_NAME
+    return MODEL_PROVIDER
+
+
+def _build_output_filename(now: Optional[datetime] = None) -> str:
+    timestamp = (now or datetime.now()).strftime("%d%m%Y_%H%M")
+    model_name = _sanitize_filename_component(_configured_model_name())
+    return f"{timestamp}_{model_name}_compliance_master_dataset.xlsx"
 
 # --- Missing-value configuration ---
 # Target fraction of records where each field must be empty (None), split
@@ -579,28 +600,37 @@ For this specific batch, aim for approximately {batch_true_count} TRUE alerts an
 
 The engine fires on fuzzy token similarity. Use **only** these approved false-positive families for records resulting in `NAME_MISMATCH`:
 
-Family A - Common-name over-match: a shared extremely common surname or given name over-fires on entirely unrelated people (e.g., John Smith vs. Arthur Smith).
-Family B - Phonetic / spelling variants of distinct people: names spelled similarly but belonging to completely different individuals.
-Family C - Transliteration across scripts for separate individuals: cross-script name collisions where the underlying entities are distinct.
-Family F - Token-order permutation of separate individuals: an order-insensitive index fires on swapped name components belonging to completely different people.
-Family G - Partial / compound-name substring over-fire: a shared surname fragment trips the engine on an unrelated compound-surname individual.
-Family K - Generation markers (Father vs. Son): Jr/Sr suffixes match separate legal entities who share a base name.
+Family F1 - Common-name over-match: a shared extremely common surname or given name over-fires on entirely unrelated people (e.g., John Smith vs. Arthur Smith).
+Family F2 - Phonetic / spelling variants of distinct people: names spelled similarly but belonging to completely different individuals.
+Family F3 - Transliteration across scripts for separate individuals: cross-script name collisions where the underlying entities are distinct.
+Family F4 - Token-order permutation of separate individuals: an order-insensitive index fires on swapped name components belonging to completely different people.
+Family F5 - Partial / compound-name substring over-fire: a shared surname fragment trips the engine on an unrelated compound-surname individual.
+Family F6 - Generation markers (Father vs. Son): Jr/Sr suffixes match separate legal entities who share a base name.
 </false_name_match_scenarios>
+
+<true_name_match_scenarios>
+*Note: Use these approved true-positive families to generate realistic variations of the same human entity resulting in an exact match or valid variation approval.*
+
+Family T1 - Transliteration & Romanization: Cross-script mapping differences pointing to the same individual due to phonetic translation.
+Family T2 - Component Omission / Addition: Missing middle names, dropped secondary maternal surnames, or added patronymics standard to the entity's culture.
+Family T3 - Cultural Permutation & Inversion: Valid reordering based on local naming conventions, such as Asian Surname-Given inversion.
+Family T4 - Typographical & Diacritic Noise: Minor spelling variations, stripped accents, or OCR errors falling within standard edit-distance thresholds.
+</true_name_match_scenarios>
 
 <cascading_logic>
 When evaluating each record, you MUST generate the `thinking` field FIRST before determining the final decision or reason. Follow this exact sequence and document your evaluation in `thinking` using **1-2 short, crisp sentences**:
 1. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2.
 2. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3.
 3. Step 3 (Name): Check `client_name` vs `hit_name` accounting for formatting and strict token order. 
-   - Exact structured match or valid identity variation (aliases, diacritic cleaning, initial expansion, cultural ordering variations) -> use available valid elements for a true decision with code (`EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH`, `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`, or `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`).
-   - Genuinely distinct individuals matching via an approved false-match family -> decision: false, decision_reason: "NAME_MISMATCH".
+   - TRUE MATCH: If utilizing a valid identity variation, you MUST explicitly cite the true match family code in your `thinking` string (e.g., "[Family T2]"). Proceed to assign a true decision reason (`EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH`, `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`, or `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`).
+   - FALSE MATCH: If utilizing an approved false-match family for distinct individuals, you MUST explicitly cite the false match family code in your `thinking` string (e.g., "[Family A]"). Proceed to assign decision: false, decision_reason: "NAME_MISMATCH".
    - ALWAYS populate `matching_text` with the token(s) that fired the engine — even on FALSE `NAME_MISMATCH` verdicts.
 </cascading_logic>
 
 {missing_quotas_section}
 
 <constraints>
-- Allowed True Reasons: "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING"
+- Allowed True Reasons: "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING", "INDETERMINATE_DEFAULT_TRUE"
 - Allowed False Reasons: "NAME_MISMATCH", "DOB_MISMATCH_OR_INVALID", "GEOGRAPHIC_MISMATCH"
 - Demographics: Sample diversely across global human backgrounds over your generation lifecycle.
 - Native Scripts & Data Quality: Include native characters/diacritics where appropriate and realistic dirty data.
@@ -667,7 +697,7 @@ def main():
         return
 
     # Export to Excel
-    output_filename = "compliance_master_dataset.xlsx"
+    output_filename = _build_output_filename()
     df = pd.DataFrame(master_dataset).sample(frac=1)
     df.to_excel(output_filename, index=False, engine='openpyxl')
         
