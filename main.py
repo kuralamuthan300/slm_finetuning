@@ -13,10 +13,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Configuration Parameters ---
-TOTAL_TRUE_ALERTS = 30 # Target total number of TRUE alerts required
-TOTAL_FALSE_ALERTS = 90 # Target total number of FALSE alerts required
+TOTAL_TRUE_ALERTS = 100 # Target total number of TRUE alerts required
+TOTAL_FALSE_ALERTS = 200 # Target total number of FALSE alerts required
 TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
-ROWS_PER_CALL = 20      # Number of rows generated per LLM call
+ROWS_PER_CALL = 10    # Number of rows generated per LLM call
 
 # --- LLM Provider Configuration ---
 MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud Gemini and a local Ollama model
@@ -112,15 +112,20 @@ def _is_effectively_missing(value) -> bool:
         return True
     return False
 
+def _build_missing_quotas(
+    batch_true_count: int, batch_false_count: int, config: dict
+) -> str:
+    """Render per-batch empty-field quotas injected into the LLM prompt.
 
-def _build_missing_quotas(batch_true_count: int, batch_false_count: int, config: dict) -> str:
-    """Render per-batch empty-field quotas injected into the LLM prompt."""
+    Updated to align strictly with the revised PEP screening decision reasons.
+    """
     lines = [
         "<missing_value_quotas>",
         f"This batch has approximately {batch_true_count} TRUE and {batch_false_count} FALSE alerts.",
         'Empty = null/omitted field. Never use placeholder text like "N/A", "-", or "unknown".',
         "Leave each field empty in EXACTLY the stated number of records per decision type:",
     ]
+
     for decision_label, decision_key, decision_total in (
         ("TRUE", "true", batch_true_count),
         ("FALSE", "false", batch_false_count),
@@ -132,15 +137,15 @@ def _build_missing_quotas(batch_true_count: int, batch_false_count: int, config:
                 lines.append(f"    - {field}: 0 (do not leave empty)")
             else:
                 lines.append(f"    - {field}: leave empty in {target_count}")
+
     lines += [
         "- Keep every emptied field consistent with `decision_reason`:",
-        "    * TRUE + DOB field emptied -> prefer `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`.",
-        "    * TRUE + city field emptied -> prefer `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`.",
-        "    * FALSE alerts: never empty the field that drives the false reason",
-        "      (keep DOBs populated on `DOB_MISMATCH_OR_INVALID`; keep country/city populated on `GEOGRAPHIC_MISMATCH`).",
-        "- Briefly note every emptied field in `thinking` (e.g. `hit_city unavailable - bypassing geography`).",
+        "    * TRUE alerts: missing DOB or geographic fields are acceptable; maintain allowed reasons like `EXACT_NAME_MATCH` or `VALID_FUZZY_MATCH`.",
+        "    * FALSE alerts: never empty the specific field that drives the false decision (e.g., keep DOBs populated on `DOB_MISMATCH`).",
+        "- Briefly note every emptied field in `thinking` (e.g., `hit_city unavailable - bypassing geography step`).",
         "</missing_value_quotas>",
     ]
+
     return "\n".join(lines)
 
 
@@ -646,14 +651,16 @@ When evaluating each record, you MUST generate the `thinking` field FIRST before
     if MODEL_PROVIDER == "gemini":
         llm = ChatGoogleGenerativeAI(
             model=GEMINI_MODEL_NAME,
-            temperature=0.7,
+            temperature=0.5,
+            top_p=0.9,
             google_api_key=os.getenv("GOOGLE_API_KEY"),
         )
     elif MODEL_PROVIDER == "ollama":
         llm = ChatOllama(
             model=OLLAMA_MODEL_NAME,
             base_url=OLLAMA_BASE_URL,
-            temperature=0.7,
+            temperature=0.5,
+            top_p=0.9,
         )
     else:
         raise ValueError(f"Unsupported MODEL_PROVIDER: {MODEL_PROVIDER!r}. Expected 'gemini' or 'ollama'.")
