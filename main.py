@@ -13,10 +13,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Configuration Parameters ---
-TOTAL_TRUE_ALERTS = 200 # Target total number of TRUE alerts required
-TOTAL_FALSE_ALERTS = 800 # Target total number of FALSE alerts required
+TOTAL_TRUE_ALERTS = 30 # Target total number of TRUE alerts required
+TOTAL_FALSE_ALERTS = 90 # Target total number of FALSE alerts required
 TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
-ROWS_PER_CALL = 25      # Number of rows generated per LLM call
+ROWS_PER_CALL = 20      # Number of rows generated per LLM call
 
 # --- LLM Provider Configuration ---
 MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud Gemini and a local Ollama model
@@ -598,14 +598,16 @@ For this specific batch, aim for approximately {batch_true_count} TRUE alerts an
 <false_name_match_scenarios>
 *Note: Unsafe evasion/normalization families (like maiden names, nicknames, prefix-stripping, and CJK inversions) have been intentionally excluded to prevent training the model to clear true risks.*
 
+CRITICAL GENERATION RULE: When creating a FALSE alert with the reason `NAME_MISMATCH`, you MUST physically generate `client_name` and `hit_name` to be visibly distinct strings. You must inject a distinguishing token (e.g., a different middle name, an added surname, or altered spelling) into one of the names. THEY CANNOT BE IDENTICAL. 
+
 The engine fires on fuzzy token similarity. Use **only** these approved false-positive families for records resulting in `NAME_MISMATCH`:
 
-Family F1 - Common-name over-match: a shared extremely common surname or given name over-fires on entirely unrelated people (e.g., John Smith vs. Arthur Smith).
-Family F2 - Phonetic / spelling variants of distinct people: names spelled similarly but belonging to completely different individuals.
-Family F3 - Transliteration across scripts for separate individuals: cross-script name collisions where the underlying entities are distinct.
-Family F4 - Token-order permutation of separate individuals: an order-insensitive index fires on swapped name components belonging to completely different people.
-Family F5 - Partial / compound-name substring over-fire: a shared surname fragment trips the engine on an unrelated compound-surname individual.
-Family F6 - Generation markers (Father vs. Son): Jr/Sr suffixes match separate legal entities who share a base name.
+Family F1 - Common-name partial/middle mismatch: The engine over-matches on common first and last names, but there is a clear distinguishing component physically present in the strings, such as completely different middle names (e.g., "John David Smith" vs "John Michael Smith"). 
+Family F2 - Phonetic / spelling variants of distinct people: Names spelled similarly but clearly belonging to completely different individuals with different token counts or structures.
+Family F3 - Transliteration across scripts for separate individuals: Cross-script name collisions where the underlying entities are distinct and visibly different in length or composition.
+Family F4 - Token-order permutation of separate individuals: An order-insensitive index fires on swapped name components, resulting in a culturally invalid or clearly distinct name structure.
+Family F5 - Partial / compound-name substring over-fire: A shared surname fragment trips the engine on an unrelated compound-surname individual (e.g., "Carlos Ruiz" vs "Carlos Ruiz-Zafón").
+Family F6 - Generation markers (Father vs. Son): Jr/Sr/III suffixes match separate legal entities who share a base name.
 </false_name_match_scenarios>
 
 <true_name_match_scenarios>
@@ -619,11 +621,11 @@ Family T4 - Typographical & Diacritic Noise: Minor spelling variations, stripped
 
 <cascading_logic>
 When evaluating each record, you MUST generate the `thinking` field FIRST before determining the final decision or reason. Follow this exact sequence and document your evaluation in `thinking` using **1-2 short, crisp sentences**:
-1. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2.
-2. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3.
+1. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2. Missing DOB is NEVER a reason to fail an alert.
+2. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3. Missing geography is NEVER a reason to fail an alert.
 3. Step 3 (Name): Check `client_name` vs `hit_name` accounting for formatting and strict token order. 
-   - TRUE MATCH: If utilizing a valid identity variation, you MUST explicitly cite the true match family code in your `thinking` string (e.g., "[Family T2]"). Proceed to assign a true decision reason (`EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH`, `EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH`, or `EXACT_NAME_MATCH_DOB_OK_CITY_MISSING`).
-   - FALSE MATCH: If utilizing an approved false-match family for distinct individuals, you MUST explicitly cite the false match family code in your `thinking` string (e.g., "[Family A]"). Proceed to assign decision: false, decision_reason: "NAME_MISMATCH".
+   - TRUE MATCH: If the names are an exact match (ignoring case), a standard initial expansion (e.g., "K. Sharma" -> "Kiran Sharma"), or utilize a valid identity variation (Family T1-T4), you MUST explicitly cite the true match family code in your `thinking`. Proceed to assign a true decision reason. **You CANNOT default to FALSE just because DOB/Geography are missing on an exact name match.**
+   - FALSE MATCH: If and only if the names have visible, physical string discrepancies (different middle names, differing compound structures, invalid permutations) utilizing an approved false-match family, explicitly cite the false match family code in your `thinking` string. Proceed to assign decision: false, decision_reason: "NAME_MISMATCH".
    - ALWAYS populate `matching_text` with the token(s) that fired the engine — even on FALSE `NAME_MISMATCH` verdicts.
 </cascading_logic>
 
@@ -636,6 +638,7 @@ When evaluating each record, you MUST generate the `thinking` field FIRST before
 - Native Scripts & Data Quality: Include native characters/diacritics where appropriate and realistic dirty data.
 - `matching_text` is required on EVERY row (never empty, never "N/A"); it may hold a single token-pair or several pairs joined by ` | `.
 - Thinking Field Style: Keep `thinking` values punchy, concise, and professional (1-2 sentences max).
+- ABSOLUTE FAIL-SAFE: If `client_name` and `hit_name` are identical strings (ignoring capitalization), the reason CANNOT BE `NAME_MISMATCH`. If you choose `NAME_MISMATCH`, you are violating system instructions unless you have generated distinct text for the two names.
 </constraints>
 """
     
