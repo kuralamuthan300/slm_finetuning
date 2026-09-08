@@ -1,6 +1,7 @@
 import json
 import math
 import re
+import random
 import unicodedata
 from datetime import datetime
 from typing import List, Optional, Literal
@@ -13,16 +14,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Configuration Parameters ---
-TOTAL_TRUE_ALERTS = 100 # Target total number of TRUE alerts required
-TOTAL_FALSE_ALERTS = 200 # Target total number of FALSE alerts required
+TOTAL_TRUE_ALERTS = 10 # Target total number of TRUE alerts required
+TOTAL_FALSE_ALERTS = 20 # Target total number of FALSE alerts required
 TOTAL_ROWS = TOTAL_TRUE_ALERTS + TOTAL_FALSE_ALERTS
-ROWS_PER_CALL = 10    # Number of rows generated per LLM call
+ROWS_PER_CALL = 5    # Number of rows generated per LLM call
 
 # --- LLM Provider Configuration ---
 MODEL_PROVIDER: Literal["gemini", "ollama"] = "ollama"   # Switch between cloud Gemini and a local Ollama model
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"   # LangChain Gemini model name
-OLLAMA_MODEL_NAME = "gemma4:31b-cloud"   # Local Ollama model name (must be pulled beforehand)
+OLLAMA_MODEL_NAME = "nemotron-3-nano:30b-cloud"   # Local Ollama model name (must be pulled beforehand)
 OLLAMA_BASE_URL = "http://localhost:11434"   # Local Ollama server URL
+
+
+def _load_all_sdn_names() -> List[str]:
+    """Load all names from sdn.csv once at startup."""
+    try:
+        df = pd.read_csv("sdn.csv")
+        # Assuming first column contains names; adjust column name if different
+        all_names = df.iloc[:, 0].dropna().astype(str).tolist()
+        print(f"Loaded {len(all_names)} names from sdn.csv")
+        return all_names
+    except Exception as e:
+        print(f"Error loading sdn.csv: {e}")
+        return []
 
 
 def _sanitize_filename_component(value: str) -> str:
@@ -548,6 +562,7 @@ def generate_batch(
     batch_size: int,
     target_true_ratio: float,
     missing_config: dict = MISSING_RATE_CONFIG,
+    candidate_names: Optional[List[str]] = None,
 ) -> List[dict]:
     batch_true_count = round(batch_size * target_true_ratio)
     batch_false_count = batch_size - batch_true_count
@@ -563,6 +578,7 @@ CRITICAL COMPLIANCE DIRECTIVES:
 1. **Human-Only Focus:** All `client_*` and `hit_*` entities are strictly human individuals (no corporate entities, shell companies, or trusts).
 2. **Avoid Type II Errors (False Negatives):** Legitimate identity variations (such as cultural name inversions, maiden/married names, cross-lingual aliases, dropped prefixes, and diacritic normalization) are **valid matches** that require human investigation, not automatic dismissals. False name mismatches (`NAME_MISMATCH`) must *only* be triggered when comparing genuinely distinct individuals who share accidental commonalities.
 3. **EU AI Act Article 10 Alignment:** Ensure the dataset is globally representative across diverse cultures, linguistic backgrounds, scripts, and naming customs to prevent proxy bias or demographic discrimination.
+4. **Decision Cascade Priority:** Follow the strict priority order when making decisions: (1) DOB—if both DOBs present and differ by >= 1 year, reject as FALSE (DOB_MISMATCH_OR_INVALID); (2) Geography—if both countries present and differ, reject as FALSE (GEOGRAPHIC_MISMATCH); (3) Name—only evaluate name matching if DOB and geography passed (or were missing). This cascade ensures hard demographic/temporal mismatches override name similarity.
 
 For this specific batch, aim for approximately {batch_true_count} TRUE alerts and {batch_false_count} FALSE alerts.
 </system>
@@ -571,6 +587,13 @@ For this specific batch, aim for approximately {batch_true_count} TRUE alerts an
 - `client_*` fields represent human retail banking customers and wealth management clients globally, reflecting diverse international demographics, age groups, and socioeconomic backgrounds.
 - `hit_*` fields represent human individuals found on high-risk watchlists: Politically Exposed Persons (PEPs), sanctioned individuals, or financial criminals, featuring diverse global origins and titles (e.g., political, military, or religious honorifics where culturally appropriate) without skewing risk solely to specific regions.
 </persona_context>
+
+<candidate_names>
+You MUST use ONLY the following names from the SDN watchlist for generating `client_name` and `hit_name` fields. Do NOT invent names outside this list:
+
+{', '.join(candidate_names) if candidate_names else 'No candidate names provided'}
+
+</candidate_names>
 
 <naming_convention>
 - `client_name` and `hit_name` must reflect realistic global naming customs for individuals (e.g., Western last/first structures, patronymics, matronymics, mononyms, multi-part surnames, and localized name orders). Do not force all human names into a rigid Western template.
@@ -613,6 +636,8 @@ Family F3 - Transliteration across scripts for separate individuals: Cross-scrip
 Family F4 - Token-order permutation of separate individuals: An order-insensitive index fires on swapped name components, resulting in a culturally invalid or clearly distinct name structure.
 Family F5 - Partial / compound-name substring over-fire: A shared surname fragment trips the engine on an unrelated compound-surname individual (e.g., "Carlos Ruiz" vs "Carlos Ruiz-Zafón").
 Family F6 - Generation markers (Father vs. Son): Jr/Sr/III suffixes match separate legal entities who share a base name.
+- **Gender-indicating morphemes**: Grammatical gender suffixes or diminutives typically indicating different genders (e.g., "Daniel" [typically male] vs "Daniela" [typically female], or "Pierre" vs "Pierrette"). Despite token overlap, these represent different individuals.
+- **Name-variant collisions**: Formal vs. diminutive or culturally-specific gender variants (e.g., "Andrea" [Italian male] vs "Andrea" [English female], "Alex" vs "Alexandra", "André" vs "Andrée"). Engine fires on the shared token but genders/contexts differ.
 </false_name_match_scenarios>
 
 <true_name_match_scenarios>
@@ -622,16 +647,53 @@ Family T1 - Transliteration & Romanization: Cross-script mapping differences poi
 Family T2 - Component Omission / Addition: Missing middle names, dropped secondary maternal surnames, or added patronymics standard to the entity's culture.
 Family T3 - Cultural Permutation & Inversion: Valid reordering based on local naming conventions, such as Asian Surname-Given inversion.
 Family T4 - Typographical & Diacritic Noise: Minor spelling variations, stripped accents, or OCR errors falling within standard edit-distance thresholds.
+- **Full name vs. subset match**: One name is a full subset/initial form of the other (e.g., "John Smith" vs "John Michael Smith", or "Ahmed" vs "Ahmed Hassan Al-Rashid"). Default to TRUE unless biographical context (age gap, region mismatch, timeline conflict) explicitly suggests they are different people.
+- **Full match in different order**: Names contain identical tokens in different order and match cultural naming conventions (e.g., "Li Ming" vs "Ming Li" both valid in Chinese naming, or "García López" vs "López García" where both are surnames). Assess context; default to TRUE if ordering is culturally plausible for the same person.
 </true_name_match_scenarios>
 
 <cascading_logic>
-When evaluating each record, you MUST generate the `thinking` field FIRST before determining the final decision or reason. Follow this exact sequence and document your evaluation in `thinking` using **1-2 short, crisp sentences**:
-1. Step 1 (DOB): Evaluate `client_dob` and `hit_dob` per the `<dob_logic>` rules above. If acceptable (< 1 year diff or missing/invalid), proceed to Step 2. Missing DOB is NEVER a reason to fail an alert.
-2. Step 2 (Geography): Check country/city fields. If missing or invalid, do not fail. Bypass geography, note it briefly in `thinking`, and proceed to Step 3. Missing geography is NEVER a reason to fail an alert.
-3. Step 3 (Name): Check `client_name` vs `hit_name` accounting for formatting and strict token order. 
-   - TRUE MATCH: If the names are an exact match (ignoring case), a standard initial expansion (e.g., "K. Sharma" -> "Kiran Sharma"), or utilize a valid identity variation (Family T1-T4), you MUST explicitly cite the true match family code in your `thinking`. Proceed to assign a true decision reason. **You CANNOT default to FALSE just because DOB/Geography are missing on an exact name match.**
-   - FALSE MATCH: If and only if the names have visible, physical string discrepancies (different middle names, differing compound structures, invalid permutations) utilizing an approved false-match family, explicitly cite the false match family code in your `thinking` string. Proceed to assign decision: false, decision_reason: "NAME_MISMATCH".
-   - ALWAYS populate `matching_text` with the token(s) that fired the engine — even on FALSE `NAME_MISMATCH` verdicts.
+When evaluating each record, you MUST generate the `thinking` field FIRST before determining the final decision. Write thinking as a brief observation of what you found across DOB, geography, and names—sufficient for an SLM to learn the reasoning pattern.
+
+**PRIORITY-BASED DECISION CASCADE** (evaluate in this order; stop at first hard rejection):
+
+1. **DOB CHECK (HARD REJECT if mismatch):**
+   - If BOTH `client_dob` and `hit_dob` are present and parseable: Calculate the difference.
+     - If difference >= 1 year → **ASSIGN FALSE** with reason: "DOB_MISMATCH_OR_INVALID"
+     - If difference < 1 year → Document (e.g., "DOBs ~8mo apart") and proceed to Step 2
+   - If either DOB is missing or unparsable → Document (e.g., "Hit DOB missing") and proceed to Step 2 (SKIP DOB REJECTION; geography and name will decide)
+
+2. **GEOGRAPHY CHECK (HARD REJECT if mismatch):**
+   - If BOTH `client_country` and `hit_country` are present and filled:
+     - If they refer to different countries (accounting for aliases like UK/United Kingdom) → **ASSIGN FALSE** with reason: "GEOGRAPHIC_MISMATCH"
+     - If they match → Document (e.g., "Countries match: Spain") and proceed to Step 3
+   - If either geography field is missing or empty → Document (e.g., "Geographic info absent") and proceed to Step 3 (SKIP GEOGRAPHY REJECTION; DOB and name will decide)
+
+3. **NAME CHECK (FINAL DECISION):**
+   - You have passed DOB and geography checks (or they were missing). Now evaluate names:
+   
+   **ASSIGN TRUE when:**
+   - Names are identical (ignoring case): "Ahmed Hassan" = "AHMED HASSAN"
+   - One is an initial expansion: "K. Sharma" = "Kiran Sharma"
+   - Names differ only in diacritics/transliteration: "José García" = "Jose Garcia" or "Ivan" = "Иван"
+   - Names are reordered per cultural convention: "Li Ming" = "Ming Li" or "García López" = "López García"
+   - One name is a full subset: "John Smith" = "John Michael Smith" or "Ahmed" = "Ahmed Hassan Al-Rashid"
+   - Minor spelling/OCR variations: "Catherine" = "Katherine"
+   
+   **ASSIGN FALSE (NAME_MISMATCH) when:**
+   - Completely different first/last names: "John" vs "James" or "Smith" vs "Johnson"
+   - Completely different middle names: "John David Smith" ≠ "John Michael Smith"
+   - Gender-indicating suffixes differ: "Daniel" ≠ "Daniela"
+   - Generation markers differ: "Robert Williams" ≠ "Robert Williams Jr."
+   - Compound surnames mismatch: "Carlos Ruiz" ≠ "Carlos Ruiz-Zafón"
+
+**Thinking Format** (document observations, not decisions):
+Capture DOB, geography, and name observations in 1-3 sentences:
+- Example TRUE: "DOBs within 1yr, country match (Spain). Names 'José García' vs 'Jose Garcia'—diacritics only, same person."
+- Example FALSE (DOB mismatch): "DOBs ~2.5yr apart (1982 vs 1984). Cannot proceed; DOB mismatch rejects alert."
+- Example FALSE (geography): "Countries differ (Spain vs UK). Cannot proceed; geographic mismatch rejects alert."
+- Example FALSE (name): "DOBs ~8mo, Spain. 'Daniel López' vs 'Daniela López'—gender suffix differs, different individuals."
+
+4. **matching_text**: Always record exact fired tokens (e.g., "José ~ Jose | García ~ Garcia" or "Daniel ~ Daniela | López ~ López").
 </cascading_logic>
 
 {missing_quotas_section}
@@ -639,11 +701,11 @@ When evaluating each record, you MUST generate the `thinking` field FIRST before
 <constraints>
 - Allowed True Reasons: "EXACT_NAME_MATCH_DOB_OK_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_MISSING_COUNTRY_MATCH", "EXACT_NAME_MATCH_DOB_OK_CITY_MISSING", "INDETERMINATE_DEFAULT_TRUE"
 - Allowed False Reasons: "NAME_MISMATCH", "DOB_MISMATCH_OR_INVALID", "GEOGRAPHIC_MISMATCH"
-- Demographics: Sample diversely across global human backgrounds over your generation lifecycle.
-- Native Scripts & Data Quality: Include native characters/diacritics where appropriate and realistic dirty data.
-- `matching_text` is required on EVERY row (never empty, never "N/A"); it may hold a single token-pair or several pairs joined by ` | `.
-- Thinking Field Style: Keep `thinking` values punchy, concise, and professional (1-2 sentences max).
-- ABSOLUTE FAIL-SAFE: If `client_name` and `hit_name` are identical strings (ignoring capitalization), the reason CANNOT BE `NAME_MISMATCH`. If you choose `NAME_MISMATCH`, you are violating system instructions unless you have generated distinct text for the two names.
+- Demographics: Sample diversely across global human backgrounds, including gender-varied names, cross-cultural naming, and realistic demographic distribution.
+- Native Scripts & Data Quality: Include native characters/diacritics, transliterations, and realistic data quality issues.
+- `matching_text` is required on EVERY row (never empty, never "N/A"); format as token pairs joined by ` | ` (e.g., "Daniel ~ Daniela | López ~ López").
+- Thinking Field Style: Capture your observations in 1-3 sentences following the cascade: note DOB observation (if checked), geography observation (if checked), and name assessment only if DOB/geography pass. Be concise and describe what you observed and why, not internal categories. This trains the SLM on the decision cascade logic.
+- ABSOLUTE FAIL-SAFE: If `client_name` and `hit_name` are identical strings (ignoring capitalization), you CANNOT assign `NAME_MISMATCH` UNLESS you intentionally generated distinct text like gender-indicating suffixes, middle name differences, or generation markers.
 </constraints>
 """
     
@@ -674,6 +736,10 @@ def main():
     master_dataset: List[dict] = []
     successful_calls = 0
 
+    # Load all SDN names once at startup
+    all_sdn_names = _load_all_sdn_names()
+    available_names = all_sdn_names.copy()  # Track unused names
+    
     print(f"Starting batch generation: Target = {TOTAL_ROWS} rows (True: {TOTAL_TRUE_ALERTS}, False: {TOTAL_FALSE_ALERTS}) | Batch Size = {ROWS_PER_CALL} | Total Calls = {total_calls}")
     
     for current_call in range(1, total_calls + 1):
@@ -683,8 +749,26 @@ def main():
         if current_batch_size <= 0:
             break
 
+        # Calculate names needed for this batch (2x for variation/matching)
+        names_needed = current_batch_size * 2
+        
+        # Check if enough names available
+        if len(available_names) < names_needed:
+            if not available_names:
+                print(f"Batch {current_call}: No more names available in sdn.csv. Stopping.")
+                break
+            else:
+                names_needed = len(available_names)
+                print(f"Batch {current_call}: Only {names_needed} names left; using all.")
+        
+        # Sample names for this batch WITHOUT replacement
+        batch_candidate_names = random.sample(available_names, names_needed)
+        available_names = [n for n in available_names if n not in batch_candidate_names]  # Remove used names
+        
+        print(f"Batch {current_call}: Sampling {names_needed} names. {len(available_names)} names remaining for future batches.")
+
         try:
-            batch_records = generate_batch(current_batch_size, global_true_ratio)
+            batch_records = generate_batch(current_batch_size, global_true_ratio, candidate_names=batch_candidate_names)
             if not batch_records:
                 raise ValueError("generate_batch returned an empty alert list.")
             batch_records = enforce_missing_rates(batch_records)
