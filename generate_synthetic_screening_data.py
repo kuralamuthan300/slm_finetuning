@@ -17,8 +17,10 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import ollama
@@ -980,7 +982,7 @@ async def generate_single_ollama_sample(
             "Screening Context: This is a True Positive alert where the candidate hit is likely the same person "
             "with minor name recording differences (e.g. slight typo, token order swap, middle name abbreviation, "
             "transliteration variant, diacritic stripping, or compound name restructuring). "
-            "Explain your reasoning step-by-step like a human compliance analyst and conclude with 'escalate to analyst'."
+            "Explain your reasoning step-by-step like a human compliance analyst crisply and conclude with 'escalate to analyst'."
         )
     else:
         context = (
@@ -988,7 +990,7 @@ async def generate_single_ollama_sample(
             "despite coincidental name overlap (e.g. simple non-matching pairs like xxxxxx yyyyyyy vs zzzzz aaaaaaa "
             "irreconcilably different surname, conflicting middle name, "
             "or phonetically divergent but legally distinct surname). "
-            "Explain your reasoning step-by-step like a human compliance analyst and conclude with 'disqualify'."
+            "Explain your reasoning step-by-step like a human compliance analyst crisply and conclude with 'disqualify'."
         )
 
     disposition_vocab = "\n".join(f"  {k} — {v}" for k, v in DISPOSITION_CODES.items())
@@ -1049,7 +1051,8 @@ async def run_hybrid_generation(
     ollama_model: str,
     batch_size: int,
     alpha: float = 0.90,
-    k_max: int = 3
+    k_max: int = 3,
+    temp_dir: str = "temp"
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Coordinates Pipeline A and Pipeline B generation, enforces global pair uniqueness,
@@ -1080,13 +1083,17 @@ async def run_hybrid_generation(
         "fallbacks_to_double_mutation": 0,
     }
 
-    # --------------------------------------------------------------------------
     # PIPELINE A: Programmatic Generation with Human Cognitive Reasoning
     # --------------------------------------------------------------------------
     if n_tp_a + n_fp_a > 0:
         print(f"\n[Pipeline A] Generating {n_tp_a} TPs and {n_fp_a} FPs with human cognitive reasoning...")
         tasks_a = [("TP", DECISION_TP)] * n_tp_a + [("FP", DECISION_FP)] * n_fp_a
         random.shuffle(tasks_a)
+
+        temp_csv_path = get_temp_csv_path(temp_dir)
+        batch_records = []
+        batch_size_write = 250
+        is_first_batch = True
 
         pbar_a = tqdm(total=len(tasks_a), desc="Pipeline A (Human-Emulating Engine)", unit="records")
         for _, decision in tasks_a:
@@ -1104,7 +1111,7 @@ async def run_hybrid_generation(
                     break
                 attempts += 1
 
-            records.append({
+            record = {
                 "client_name": client_name,
                 "hit_name": hit_name,
                 "matching_text": matching_text,
@@ -1112,9 +1119,22 @@ async def run_hybrid_generation(
                 "thinking": thinking,
                 "decision": decision,
                 "created_by": "rule_based"
-            })
+            }
+            batch_records.append(record)
+            records.append(record)
             metrics["pipeline_a_count"] += 1
+            
+            # Write batch to temp CSV every 250 records
+            if len(batch_records) >= batch_size_write:
+                write_records_batch_to_csv(batch_records, temp_csv_path, is_first_batch)
+                is_first_batch = False
+                batch_records = []
+            
             pbar_a.update(1)
+        
+        # Write remaining Pipeline A records
+        if batch_records:
+            write_records_batch_to_csv(batch_records, temp_csv_path, is_first_batch)
         pbar_a.close()
 
     # --------------------------------------------------------------------------
@@ -1156,17 +1176,22 @@ async def run_hybrid_generation(
                 attempts += 1
 
         random.shuffle(fuzzy_items_b)
+        temp_csv_path = get_temp_csv_path(temp_dir)
+        batch_records_b = []
+        batch_size_write = 250
+        is_first_batch_b = not Path(temp_csv_path).exists()  # Check if file already has Pipeline A data
+
         pbar_b = tqdm(total=len(fuzzy_items_b), desc="Pipeline B (Ollama Human Review)", unit="records")
 
         async def process_ollama_fuzzy_item(
             c_name: str, h_name: str, fallback_match: str, fallback_d_code: str, fallback_th: str, tgt_dec: str
         ):
-            nonlocal metrics
+            nonlocal metrics, batch_records_b, is_first_batch_b
             alert = await generate_single_ollama_sample(
                 ollama_client, ollama_model, c_name, h_name, tgt_dec, fallback_d_code, semaphore
             )
             if alert and alert.thinking and alert.decision:
-                records.append({
+                record = {
                     "client_name": c_name,
                     "hit_name": h_name,
                     "matching_text": alert.matching_text or fallback_match,
@@ -1174,11 +1199,11 @@ async def run_hybrid_generation(
                     "thinking": alert.thinking,
                     "decision": alert.decision,
                     "created_by": "ollama"
-                })
+                }
                 metrics["pipeline_b_count"] += 1
             else:
                 metrics["fallbacks_to_double_mutation"] += 1
-                records.append({
+                record = {
                     "client_name": c_name,
                     "hit_name": h_name,
                     "matching_text": fallback_match,
@@ -1186,11 +1211,26 @@ async def run_hybrid_generation(
                     "thinking": fallback_th,
                     "decision": tgt_dec,
                     "created_by": "rule_based"
-                })
+                }
                 metrics["pipeline_a_count"] += 1
+            
+            batch_records_b.append(record)
+            records.append(record)
+            
+            # Write batch to temp CSV every 250 records
+            if len(batch_records_b) >= batch_size_write:
+                write_records_batch_to_csv(batch_records_b, temp_csv_path, is_first_batch_b)
+                is_first_batch_b = False
+                batch_records_b = []
+            
             pbar_b.update(1)
 
         await asyncio.gather(*(process_ollama_fuzzy_item(*item) for item in fuzzy_items_b))
+        
+        # Write remaining Pipeline B records
+        if batch_records_b:
+            write_records_batch_to_csv(batch_records_b, temp_csv_path, is_first_batch_b)
+        
         pbar_b.close()
 
     elapsed = time.time() - start_time
@@ -1249,6 +1289,64 @@ async def verify_ollama_model(model_tag: str) -> str:
         f"Available models: {available_models}\n"
         f"Please run `ollama pull {model_tag}` or specify an available model with --ollama_model."
     )
+
+# ==============================================================================
+# TEMP FOLDER & INCREMENTAL CSV MANAGEMENT
+# ==============================================================================
+
+def setup_temp_folder(temp_dir: str = "temp") -> str:
+    """
+    Create temp folder and initialize .gitignore file.
+    Returns the temp directory path.
+    """
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(exist_ok=True)
+    
+    gitignore_path = temp_path / ".gitignore"
+    if not gitignore_path.exists():
+        gitignore_path.write_text("# Temporary files for incremental CSV writing\n*.csv\n")
+        print(f"[Setup] Created {gitignore_path}")
+    
+    return temp_dir
+
+def get_temp_csv_path(temp_dir: str = "temp") -> str:
+    """Get path to incremental CSV in temp folder."""
+    return str(Path(temp_dir) / "synthetic_alerts_incremental.csv")
+
+def write_records_batch_to_csv(
+    records: List[Dict[str, str]], 
+    csv_path: str, 
+    is_first_batch: bool = False
+) -> None:
+    """
+    Append batch of records to CSV file with proper formatting.
+    
+    Args:
+        records: List of alert records to write
+        csv_path: Path to CSV file
+        is_first_batch: If True, write headers; if False, append without headers
+    """
+    if not records:
+        return
+    
+    df_batch = pd.DataFrame(records)
+    df_batch["disposition_label"] = df_batch["disposition_code"].map(
+        lambda c: DISPOSITION_CODES.get(c, "Unknown disposition code")
+    )
+    # Ensure column order
+    df_batch = df_batch[["client_name", "hit_name", "matching_text", "disposition_code", 
+                         "disposition_label", "thinking", "decision", "created_by"]]
+    
+    mode = 'w' if is_first_batch else 'a'
+    header = is_first_batch
+    df_batch.to_csv(csv_path, mode=mode, header=header, index=False)
+
+def cleanup_temp_csv(temp_dir: str = "temp") -> None:
+    """Remove only the incremental CSV, keep .gitignore for future runs."""
+    temp_csv = Path(temp_dir) / "synthetic_alerts_incremental.csv"
+    if temp_csv.exists():
+        temp_csv.unlink()
+        print(f"[Cleanup] Removed temporary CSV: {temp_csv}")
 
 # ==============================================================================
 # MAIN CLI ENTRYPOINT
@@ -1462,6 +1560,9 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
 
+    # 0. Setup temp folder with .gitignore
+    temp_dir = setup_temp_folder()
+
     # Resolve counts and percentages
     num_tp, num_fp, tp_pct, fp_pct, ollama_pct, fuzzy_pct = resolve_counts_and_percentages(args)
     total_target = num_tp + num_fp
@@ -1477,6 +1578,7 @@ def main():
     print(f"Generation Split:        Fuzzy Match: {fuzzy_pct:.1f}% | Ollama: {ollama_pct:.1f}%")
     print(f"Multi-Ethnic Diversity:  {'ENABLED (Global Pools Included)' if args.augment_diversity else 'DISABLED'}")
     print(f"Ollama Concurrency:      Batch Size {args.batch_size}")
+    print(f"Temp Folder:             {temp_dir}/")
     
     # Estimate time to completion
     est_seconds, est_time_str = estimate_generation_time(total_target, fuzzy_pct, ollama_pct, args.batch_size)
@@ -1513,20 +1615,36 @@ def main():
             ollama_model=resolved_model,
             batch_size=args.batch_size,
             alpha=alpha,
-            k_max=3
+            k_max=3,
+            temp_dir=temp_dir
         )
     )
 
-    # 4. Global Uniqueness and Integrity Verification
+    # 4. Merge temp CSV with in-memory results
+    temp_csv_path = get_temp_csv_path(temp_dir)
+    if Path(temp_csv_path).exists():
+        try:
+            df_temp = pd.read_csv(temp_csv_path)
+            # Combine temp CSV with final results, avoiding duplicates
+            df_results = pd.concat([df_temp, df_results], ignore_index=True)
+            df_results = df_results.drop_duplicates(subset=["client_name", "hit_name"], keep="first")
+            print(f"[Merge] Loaded {len(df_temp)} records from temp CSV")
+        except Exception as e:
+            print(f"[Warning] Failed to merge temp CSV: {e}")
+
+    # 5. Global Uniqueness and Integrity Verification
     total_records = len(df_results)
     unique_pairs = df_results[["client_name", "hit_name"]].drop_duplicates()
     is_strictly_unique = len(unique_pairs) == total_records
 
-    # 5. Export to CSV
+    # 6. Export to CSV
     df_results.to_csv(args.output_csv_path, index=False)
     print(f"\n[Export] Saved {len(df_results)} records to '{args.output_csv_path}'.")
 
-    # 6. Print Execution Metrics Summary
+    # 7. Cleanup temp CSV (keep .gitignore)
+    cleanup_temp_csv(temp_dir)
+
+    # 8. Print Execution Metrics Summary
     print("\n" + "=" * 75)
     print("                       PIPELINE EXECUTION METRICS                        ")
     print("=" * 75)
