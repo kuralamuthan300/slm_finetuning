@@ -985,7 +985,8 @@ async def generate_single_ollama_sample(
     else:
         context = (
             "Screening Context: This is a False Positive alert where the candidate hit is a distinct individual "
-            "despite coincidental name overlap (e.g. irreconcilably different surname, conflicting middle name, "
+            "despite coincidental name overlap (e.g. simple non-matching pairs like xxxxxx yyyyyyy vs zzzzz aaaaaaa "
+            "irreconcilably different surname, conflicting middle name, "
             "or phonetically divergent but legally distinct surname). "
             "Explain your reasoning step-by-step like a human compliance analyst and conclude with 'disqualify'."
         )
@@ -1344,14 +1345,14 @@ def parse_args():
     parser.add_argument(
         "--tp_percentage", "--tp_pct",
         type=float,
-        default=20,
-        help="Target percentage for True Positive (TP) alerts (0.0 - 100.0, default: 20.0)."
+        default=40,
+        help="Target percentage for True Positive (TP) alerts (0.0 - 100.0, default: 40.0)."
     )
     parser.add_argument(
         "--fp_percentage", "--fp_pct",
         type=float,
-        default=80,
-        help="Target percentage for False Positive (FP) alerts (0.0 - 100.0, default: 80.0)."
+        default=60,
+        help="Target percentage for False Positive (FP) alerts (0.0 - 100.0, default: 60.0)."
     )
     parser.add_argument(
         "--num_true_positives", "-tp",
@@ -1415,6 +1416,46 @@ def parse_args():
     )
     return parser.parse_args()
 
+def estimate_generation_time(num_records: int, fuzzy_pct: float, ollama_pct: float, batch_size: int) -> Tuple[float, str]:
+    """
+    Estimates the total generation time based on pipeline configuration.
+    
+    Returns:
+        (estimated_seconds, human_readable_string)
+    
+    Assumptions:
+        - Pipeline A (RapidFuzz): ~20,000 records/sec
+        - Pipeline B (Ollama): ~10-15 records/sec per concurrent batch
+    """
+    # Split records by pipeline
+    num_a = num_records * (fuzzy_pct / 100.0)
+    num_b = num_records * (ollama_pct / 100.0)
+    
+    # Throughput estimates (records per second)
+    pipeline_a_throughput = 20000.0  # RapidFuzz is very fast
+    pipeline_b_throughput = max(5.0, min(15.0, batch_size * 0.8))  # Ollama: ~0.8 rec/sec per concurrent request
+    
+    # Calculate time per pipeline
+    time_a = num_a / pipeline_a_throughput if pipeline_a_throughput > 0 else 0
+    time_b = num_b / pipeline_b_throughput if pipeline_b_throughput > 0 else 0
+    
+    total_seconds = time_a + time_b
+    
+    # Format human-readable output
+    if total_seconds < 1:
+        time_str = f"{total_seconds:.1f}s"
+    elif total_seconds < 60:
+        time_str = f"{total_seconds:.1f}s"
+    elif total_seconds < 3600:
+        minutes = total_seconds / 60.0
+        time_str = f"{minutes:.1f}m"
+    else:
+        hours = total_seconds / 3600.0
+        minutes = (total_seconds % 3600) / 60.0
+        time_str = f"{hours:.1f}h {minutes:.0f}m"
+    
+    return total_seconds, time_str
+
 def main():
     args = parse_args()
 
@@ -1436,6 +1477,11 @@ def main():
     print(f"Generation Split:        Fuzzy Match: {fuzzy_pct:.1f}% | Ollama: {ollama_pct:.1f}%")
     print(f"Multi-Ethnic Diversity:  {'ENABLED (Global Pools Included)' if args.augment_diversity else 'DISABLED'}")
     print(f"Ollama Concurrency:      Batch Size {args.batch_size}")
+    
+    # Estimate time to completion
+    est_seconds, est_time_str = estimate_generation_time(total_target, fuzzy_pct, ollama_pct, args.batch_size)
+    print(f"Estimated Time:          ~{est_time_str}")
+    print("=" * 75)
 
     # 1. Pre-flight verification
     resolved_model = args.ollama_model
