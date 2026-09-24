@@ -268,6 +268,18 @@ wheels = [
 ]
 
 [[package]]
+name = "faker"
+version = "40.39.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6d/62/fea935af7a312f073c99d470b05a7c96650ee8d9562ce82e8cb7ee4c1247/faker-40.39.0.tar.gz", hash = "sha256:52799ad96fcf92aab2fc96a9e03869bbf1a634300f7cd91c38dbfd51f639f6fa", size = 2029463, upload-time = "2026-09-14T16:50:17.939Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/45/c8/901282279841ebb59216433be01aac825fb905e1a597de3b7b5ab8b0c43e/faker-40.39.0-py3-none-any.whl", hash = "sha256:c4c7ec2cddfaf602c5a8a2c960614946aa8c161250bd9d49a8846cd24d1ef028", size = 2066232, upload-time = "2026-09-14T16:50:16.061Z" },
+]
+
+[[package]]
 name = "filetype"
 version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -846,6 +858,7 @@ name = "slm-finetuning"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "faker" },
     { name = "langchain-google-genai" },
     { name = "langchain-ollama" },
     { name = "ollama" },
@@ -860,6 +873,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "faker", specifier = ">=40.39.0" },
     { name = "langchain-google-genai", specifier = ">=4.3.7" },
     { name = "langchain-ollama", specifier = ">=0.3.0" },
     { name = "ollama", specifier = ">=0.6.2" },

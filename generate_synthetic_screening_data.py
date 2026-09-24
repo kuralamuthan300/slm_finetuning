@@ -7,7 +7,29 @@ Simulates individual name-matching alerts from an AML/Sanctions client screening
 hybrid Programmatic (RapidFuzz) / Ollama structured generation architecture. The split is
 configurable and defaults to 30% Programmatic / 70% Ollama (--fuzzy_percentage /
 --ollama_percentage); the reserved exact-match and cross-gender categories are carved out of the
-decision budgets, so the requested total is always produced exactly.
+decision budgets, so the requested total is always produced exactly. The decision balance also
+defaults to an even split — 50% 'escalate to analyst' (True Positive) / 50% 'disqualify' (False
+Positive), overridable via --tp_percentage / --fp_percentage or the explicit -tp / -fp counts.
+
+DISPOSITION LABEL BALANCE (--disposition_balance, default 'even'):
+    The 13 disposition codes are quota-planned instead of drawn at random, so every label is
+    EQUALLY represented WITHIN ITS DECISION FAMILY: the True Positive budget is apportioned
+    evenly over the 9 TP codes and the False Positive budget evenly over the 4 FP codes
+    (largest-remainder rounding keeps the quotas summing exactly to the requested counts).
+    Because the decision split is untouched, the dataset can stay 50/50 'escalate' /
+    'disqualify' while no single label is over-represented. Each quota is generated through the
+    mutation that actually produces that code (capability-aware client sourcing), and the
+    emitted label is asserted — a generator that silently falls back to a neighbouring code is
+    redrawn rather than allowed to contaminate the balance. Pipeline B passes the assigned code
+    to the model as a mandate and discards a narrative whose code had to be corrected.
+    '--disposition_balance off' restores the original free-running behaviour.
+
+NAME SUPPLY (--faker_names, default on):
+    Besides sdn.csv, source names are drawn from the Faker library across a set of Latin-script
+    locales (--faker_locales / --faker_names_per_locale). That widens every mutation capability
+    pool — most importantly it is the only realistic supply of diacritic-bearing names
+    (František Ševčík, Jürgen Müller, Václav Navrátil), which are otherwise unreachable in an
+    ASCII-only sanctions list.
 
 Output CSV Schema:
     client_name, hit_name, matching_text, disposition_code, disposition_label, thinking, decision, created_by
@@ -22,11 +44,13 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import ollama
 import pandas as pd
+from faker import Faker
 from pydantic import BaseModel, Field
 from rapidfuzz.distance import Levenshtein
 from tqdm import tqdm
@@ -80,6 +104,20 @@ DISPOSITION_FP_CODES = [
     "DISP_GIVEN_NAME_GENDER_VARIANT",
 ]
 DISPOSITION_TP_CODES = [k for k in DISPOSITION_CODES if k not in set(DISPOSITION_FP_CODES)]
+
+# Membership sets and the decision each code always resolves to. Used by the balance planner,
+# the capability pools, and the label-semantics audit (a code and a decision are two views of
+# the same name-level judgement, so this mapping must have exactly one answer per code).
+DISPOSITION_FP_SET: Set[str] = set(DISPOSITION_FP_CODES)
+DISPOSITION_TP_SET: Set[str] = set(DISPOSITION_TP_CODES)
+DISPOSITION_DECISIONS: Dict[str, str] = {
+    **{code: DECISION_TP for code in DISPOSITION_TP_CODES},
+    **{code: DECISION_FP for code in DISPOSITION_FP_CODES},
+}
+
+# Accepted values for --disposition_balance / --disposition_balance_scope
+DISPOSITION_BALANCE_MODES = ("even", "weighted", "off")
+BALANCE_SCOPE_PER_DECISION = "per_decision"
 
 # Final CSV column order — shared by the in-memory frame, the incremental writer and the
 # exported dataset, so the three can never disagree.
@@ -283,6 +321,73 @@ PHONETIC_PAIRS = {
 # NAME NORMALIZATION & FILTERING
 # ==============================================================================
 
+# Latin-script Faker locales used to widen the name supply beyond sdn.csv. Every locale here
+# emits Latin characters (diacritics included, which is the only realistic supply of names for
+# DISP_DIACRITIC_STRIPPED); non-Latin-script providers (el_GR, ru_RU, zh_CN, ja_JP, ...) are
+# deliberately excluded because the mutation maps operate on Latin tokens, but a caller can
+# still opt into them explicitly via --faker_locales.
+FAKER_LOCALES: List[str] = [
+    "en_US", "en_GB", "fr_FR", "de_DE", "es_ES", "it_IT", "pt_BR", "nl_NL",
+    "sv_SE", "no_NO", "da_DK", "fi_FI", "pl_PL", "cs_CZ", "ro_RO", "hu_HU",
+    "tr_TR", "id_ID",
+]
+
+# Honorifics and academic/generational suffixes that Faker's `name()` providers emit
+# ('Prof. Jörgen Ehlert B.Eng.', 'Dr. Mila Melani, M.Farm', 'pan Emil Sus', 'V. Tóth Mónika').
+# They are stripped before a name enters the pool so a title can never become a name token of
+# its own — and so a name-level mutation is never applied to a job title.
+NAME_TITLES: Set[str] = {
+    "dr", "drs", "dott", "dra", "prof", "univ.prof", "ing", "mgr", "mgr.", "mvdr",
+    "mr", "mrs", "ms", "miss", "sir", "madam", "madame", "mlle", "mme", "m", "mm",
+    "sr", "sra", "srta", "don", "doña", "dona", "pan", "pani", "panna", "hr", "frau",
+    "herr", "mevrouw", "de heer", "meneer", "senhor", "senhora", "signor", "signora",
+    "señor", "señora", "shaykh", "sheik", "sheikh", "sayyid", "haji", "hajji",
+    "av", "yrd. doç", "doç", "yrd", "doc", "bp", "ifj", "id", "fh", "v",
+}
+
+NAME_SUFFIXES: Set[str] = {
+    "jr", "sr", "ii", "iii", "iv", "phd", "md", "esq", "mba", "msc", "bsc", "beng",
+    "beng.", "ba", "ma", "llb", "llm", "dnp", "rn", "cfa", "cpa", "med", "m.farm",
+    "m.phil", "mph", "dds", "dvm", "pharmd", "b.a", "m.a", "b.sc", "m.sc", "b.eng",
+    "m.eng", "b.ed", "m.ed", "b.com", "m.com", "b.tech", "m.tech", "th.s",
+}
+
+
+def _honorific_key(token: str) -> str:
+    """Normalizes a token for title/suffix lookup: case-folded, dots and commas removed."""
+    return re.sub(r"[.,]", "", token).strip().lower()
+
+
+def _honorific_lookup(collection: Set[str]) -> Set[str]:
+    """Indexes a title/suffix collection on the same key used by _honorific_key()."""
+    return {_honorific_key(item) for item in collection}
+
+
+_HONORIFIC_TITLE_KEYS: Set[str] = _honorific_lookup(NAME_TITLES)
+_HONORIFIC_SUFFIX_KEYS: Set[str] = _honorific_lookup(NAME_SUFFIXES)
+
+
+def strip_titles_and_suffixes(raw_name: str) -> str:
+    """
+    Removes honorifics, academic degrees and generational suffixes from a raw name string.
+
+    Deliberately token-based (not a positional prefix/suffix regex): Faker locales place these
+    markers anywhere ('Dr Eric Buckley', 'Sonia Römer MBA.', 'Univ.Prof. Karina Krogh',
+    'V. Tóth Mónika'), so every token whose normalized form is a known title or degree is
+    dropped. Single-letter initials ('A.') are preserved — they are legitimate name data and the
+    DISP_MIDDLE_INITIAL_EXPANDED capability depends on them.
+    """
+    kept: List[str] = []
+    for token in raw_name.split():
+        key = _honorific_key(token)
+        if not key:
+            continue
+        if key in _HONORIFIC_TITLE_KEYS or key in _HONORIFIC_SUFFIX_KEYS:
+            continue
+        kept.append(token)
+    return " ".join(kept)
+
+
 def clean_and_normalize_name(raw_name: str) -> Optional[str]:
     """
     Cleans raw screening name text, formats 'LASTNAME, Firstname Middlename'
@@ -307,8 +412,8 @@ def clean_and_normalize_name(raw_name: str) -> Optional[str]:
         given = parts[1]
         name = f"{given} {surname}"
 
-    # Remove unwanted prefixes/titles like Dr., Shaykh, Sheik, Mr., Mrs.
-    name = re.sub(r"\b(Dr\.|Shaykh|Sheik|Sheikh|Mr\.|Mrs\.|Ms\.|Prof\.)\s*", "", name, flags=re.IGNORECASE)
+    # Remove unwanted titles/degrees (Dr., Shaykh, Mr., Prof., MBA., B.Eng., ...)
+    name = strip_titles_and_suffixes(name)
 
     # Normalize whitespace
     name = re.sub(r"\s+", " ", name).strip()
@@ -334,15 +439,104 @@ def clean_and_normalize_name(raw_name: str) -> Optional[str]:
 
     return name
 
+def _is_faker_name_acceptable(name: str) -> bool:
+    """
+    Rejects a Faker-generated name that survived normalization but still carries a marker rather
+    than name data: residual dots (an unlisted degree such as 'Th.S.'), digits, or single-letter
+    stubs other than a legitimate initial ('A.').
+
+    Faker's `name()` providers sprinkle locale-specific honorifics and degrees anywhere in the
+    string, so this is the safety net behind strip_titles_and_suffixes(): anything still looking
+    like a title/degree is dropped instead of mutating a job title into a "name".
+    """
+    for token in name.split():
+        if any(ch.isdigit() for ch in token):
+            return False
+        if "." in token and not re.fullmatch(r"[A-Za-z]\.", token):
+            return False
+    return True
+
+
+def generate_faker_names(
+    per_locale: int = 150,
+    locales: Optional[List[str]] = None,
+    middle_name_ratio: float = 0.35
+) -> List[str]:
+    """
+    Generates additional individual names with the Faker library, across a set of Latin-script
+    locales, and returns them normalized the same way as every other source name.
+
+    Composition is deliberate rather than a bare `faker.name()` call, so the pool feeds the
+    mutation capability pools that sdn.csv cannot:
+      - `first + last`                  : the bulk of the pool;
+      - `first + middle + last`         : supplies DISP_MIDDLE_* codes with multi-token names;
+      - `name()` (locale formatter)     : keeps native conventions (particles, hyphenated
+                                          surnames) in the mix for realistic variety.
+    Every candidate is passed through clean_and_normalize_name(), which strips honorifics and
+    degrees, then through _is_faker_name_acceptable(). Duplicates inside the Faker pool are
+    impossible because each locale is generated through Faker's `unique` proxy.
+
+    Returns a list of clean names (callers dedupe against the CSV/global pools).
+    """
+    if per_locale <= 0:
+        return []
+
+    locale_list = list(locales) if locales else list(FAKER_LOCALES)
+    generated: List[str] = []
+    seen: Set[str] = set()
+
+    for locale in locale_list:
+        try:
+            faker = Faker(locale)
+        except Exception as exc:  # noqa: BLE001 — an unknown locale must not kill the run
+            print(f"[Warning] Faker locale '{locale}' unavailable ({exc}); skipping it.")
+            continue
+
+        for index in range(per_locale):
+            try:
+                if index and index % 5 == 0:
+                    # Every fifth draw keeps the provider's own formatting (particles such as
+                    # 'van der Sloot-Huijben', hyphenated surnames, locale order conventions).
+                    candidate = faker.unique.name()
+                elif random.random() < middle_name_ratio:
+                    # Multi-token form for the middle-name mutations.
+                    candidate = (
+                        f"{faker.unique.first_name()} "
+                        f"{faker.unique.first_name()} "
+                        f"{faker.unique.last_name()}"
+                    )
+                else:
+                    candidate = f"{faker.unique.first_name()} {faker.unique.last_name()}"
+            except Exception:  # noqa: BLE001 — UniquenessException, provider gaps, ...
+                continue
+
+            norm = clean_and_normalize_name(candidate)
+            if not norm or not _is_faker_name_acceptable(norm):
+                continue
+            if norm.lower() in seen:
+                continue
+            seen.add(norm.lower())
+            generated.append(norm)
+
+    return generated
+
+
 def load_source_names(
     csv_path: Optional[str] = "sdn.csv",
     name_column: Optional[str] = None,
-    augment_diversity: bool = True
+    augment_diversity: bool = True,
+    use_faker: bool = True,
+    faker_names_per_locale: int = 150,
+    faker_locales: Optional[List[str]] = None
 ) -> List[str]:
     """
     Loads source names from input CSV, detecting the appropriate column,
     and optionally augments the pool with diverse global multi-ethnic names across
     East Asian, South Asian, African, MENA, Slavic, European, and Hispanic traditions.
+
+    `use_faker` additionally draws names from the Faker library across Latin-script locales
+    (see generate_faker_names), which is what makes the diacritic and compound-name mutation
+    capabilities reachable at scale.
     """
     cleaned_names: List[str] = []
     seen = set()
@@ -373,8 +567,8 @@ def load_source_names(
             print(f"[Warning] Could not load CSV at '{csv_path}': {e}. Using global name pools.")
 
     # Augment with rich multi-ethnic global name varieties
+    injected_count = 0
     if augment_diversity or not cleaned_names:
-        injected_count = 0
         for region, names in GLOBAL_NAME_POOLS.items():
             for n in names:
                 if n.lower() not in seen:
@@ -382,8 +576,23 @@ def load_source_names(
                     cleaned_names.append(n)
                     injected_count += 1
 
+    # Augment with Faker names across Latin-script locales — the widest source of variety, and
+    # the only realistic supply of diacritic-bearing names for DISP_DIACRITIC_STRIPPED.
+    faker_count = 0
+    if use_faker and faker_names_per_locale > 0:
+        for n in generate_faker_names(faker_names_per_locale, faker_locales):
+            if n.lower() not in seen:
+                seen.add(n.lower())
+                cleaned_names.append(n)
+                faker_count += 1
+
     if not cleaned_names:
         raise ValueError(f"No valid individual names found in input source.")
+    if faker_count:
+        print(
+            f"[Loading Data] Name pool augmented: +{injected_count} global multi-ethnic, "
+            f"+{faker_count} Faker names ({len(cleaned_names)} total after dedupe)."
+        )
 
     return cleaned_names
 
@@ -870,7 +1079,6 @@ def apply_diacritic_normalization(name: str) -> Tuple[str, str, str, str]:
                 return hit_name, matching_text, disposition_code, thinking
 
     # Fallback: simulate stripping by lowercasing non-ASCII chars generically
-    import unicodedata
     hit_tokens = tokens[:]
     changed_idx = -1
     orig_tok = ""
@@ -1320,6 +1528,7 @@ async def generate_single_ollama_sample(
     max_retries: int = 4,
     enforce_disposition_code: Optional[str] = None,
     enforce_decision: Optional[str] = None,
+    strict_disposition_code: bool = False,
     override_counter: Optional[Dict[str, int]] = None
 ) -> Optional[ScreeningAlert]:
     """
@@ -1334,15 +1543,22 @@ async def generate_single_ollama_sample(
     reasoning they need:
       - one token is the gendered counterpart   -> NEAR-IDENTICAL CROSS-GENDER context
       - anything else                           -> the generic True/False Positive context
-    enforce_disposition_code / enforce_decision pin the final label of reserved
-    categories, and override_counter tallies every correction for the pipeline metrics.
+    enforce_disposition_code is the code ASSIGNED to this alert by the disposition plan: it is
+    stated in the prompt as a mandate (so the model narrates that phenomenon) and it pins the
+    emitted label. enforce_decision pins the decision. override_counter tallies every correction
+    for the pipeline metrics.
+    strict_disposition_code (used by balanced runs, where every pair carries an assigned code)
+    additionally DISCARDS a sample whose code had to be corrected: the model's narrative then
+    describes a different name-level phenomenon than the emitted code, so the programme's own
+    code-correct narrative is used instead.
 
     A sample is only accepted when the model's own decision needed no correction AND agrees
     with the alert's requested resolution. A narrative whose conclusion contradicts the
     emitted label would be unusable training data, so such samples are discarded (tallied,
     never retried) and the caller emits the matching programmatic record instead. Purely
     cosmetic code substitutions (e.g. an informal code normalised onto the vocabulary) keep
-    the model's narrative, because it still describes the same name comparison.
+    the model's narrative when the run is not strict, because it still describes the same
+    name comparison.
     """
     if client_name.strip().lower() == hit_name.strip().lower():
         raise ValueError(
@@ -1375,10 +1591,24 @@ async def generate_single_ollama_sample(
 
     disposition_vocab = "\n".join(f"  {k} — {v}" for k, v in DISPOSITION_CODES.items())
 
+    # In a balanced run the code is ASSIGNED by the disposition plan, so the model is told which
+    # name-level phenomenon its narrative must explain — the reason a balanced dataset can still
+    # be plausibly narrated, instead of every quota slot drifting to whichever code the model
+    # happens to prefer.
+    assigned_code_mandate = ""
+    if enforce_disposition_code:
+        assigned_code_mandate = (
+            f"\nAssigned disposition phenomenon: the name-level difference in this alert is "
+            f"'{enforce_disposition_code}' ({DISPOSITION_CODES.get(enforce_disposition_code, '')}). "
+            f"Your reasoning must explain exactly this difference, and the JSON field "
+            f"\"disposition_code\" MUST be \"{enforce_disposition_code}\".\n"
+        )
+
     user_prompt = (
         f"Client Name: \"{client_name}\"\n"
         f"Candidate Hit Name: \"{hit_name}\"\n"
-        f"{context}\n\n"
+        f"{context}\n"
+        f"{assigned_code_mandate}\n"
         f"Compare the two names token-by-token as a human reviewer. "
         f"Do NOT use mathematical formulas, algorithms, or similarity scores. "
         f"Output raw JSON with exactly these fields:\n"
@@ -1434,6 +1664,17 @@ async def generate_single_ollama_sample(
                     # The decision had to be corrected (or disagreed with the request), so the
                     # narrative describes a different judgement than the emitted label: discard
                     # the sample and let the caller emit the programmatic record.
+                    return None
+
+                if strict_disposition_code and enforce_disposition_code and \
+                        "disposition_code" in local_overrides:
+                    # Balanced run: the assigned code is part of the contract, and a narrative
+                    # that argued for another phenomenon would silently mislabel the training
+                    # row. Discard it (tallied) so the code-correct rule-based narrative ships.
+                    if override_counter is not None:
+                        override_counter["code_mismatch_discards"] = (
+                            override_counter.get("code_mismatch_discards", 0) + 1
+                        )
                     return None
                 return alert
             except Exception as e:
@@ -1615,6 +1856,425 @@ def build_unique_pipeline_a_pair(
 
 
 # ==============================================================================
+# DISPOSITION LABEL BALANCE: QUOTA PLANNING & CAPABILITY-AWARE SOURCING
+# When a disposition plan is active (--disposition_balance even/weighted) every code is
+# generated THROUGH the mutation that actually produces it, so each label is equally
+# represented within its decision family instead of competing on mutation survival rate.
+# ==============================================================================
+
+# The mutation that genuinely produces each code. Pipeline A dispatches through this map when a
+# plan is active, instead of drawing a random generator from the family — a quota can then only
+# be filled by the generator whose output carries that label.
+DISPOSITION_GENERATORS: Dict[str, Callable[[str], Tuple[str, str, str, str]]] = {
+    "DISP_MINOR_TYPO": apply_minor_typo,
+    "DISP_TOKEN_ORDER_SWAP": apply_token_transposition,
+    "DISP_MIDDLE_NAME_ABBREVIATED": apply_middle_truncation_expansion,
+    "DISP_MIDDLE_INITIAL_EXPANDED": apply_middle_truncation_expansion,
+    "DISP_MIDDLE_NAME_OMITTED": apply_middle_name_omission,
+    "DISP_TRANSLITERATION_VARIANT": apply_transliteration_variant,
+    "DISP_DIACRITIC_STRIPPED": apply_diacritic_normalization,
+    "DISP_COMPOUND_NAME_RESTRUCTURED": apply_compound_name_restructuring,
+    "DISP_EXACT_NAME_MATCH": apply_exact_name_match,
+    "DISP_SURNAME_CONFLICT": apply_distinct_surname_swap,
+    "DISP_MIDDLE_NAME_CONFLICT": apply_middle_name_conflict,
+    "DISP_PHONETIC_SURNAME_DIVERGENCE": apply_phonetic_shift,
+    # DISP_GIVEN_NAME_GENDER_VARIANT is intentionally absent: it is built by the dedicated
+    # build_gender_variant_pair() and handled explicitly in build_unique_pair_for_code().
+}
+
+# Distinct hit names a single capable client name can yield, per code. Only used for the
+# pre-flight capacity estimate (a documented approximation, never a hard guarantee).
+DISPOSITION_VARIANT_SPACE: Dict[str, int] = {
+    "DISP_MINOR_TYPO": 40,                                # character position x mutation kind
+    "DISP_TOKEN_ORDER_SWAP": 1,                           # exactly one reordering
+    "DISP_MIDDLE_NAME_ABBREVIATED": 3,                    # truncation is effectively single
+    "DISP_MIDDLE_INITIAL_EXPANDED": len(ALTERNATIVE_MIDDLE_NAMES),
+    "DISP_MIDDLE_NAME_OMITTED": 2,                        # omit, or add an initial
+    "DISP_TRANSLITERATION_VARIANT": 4,                    # known romanisation variants
+    "DISP_DIACRITIC_STRIPPED": 2,                         # stripped or restored
+    "DISP_COMPOUND_NAME_RESTRUCTURED": 2,                 # split or merged
+    "DISP_EXACT_NAME_MATCH": 1,
+    "DISP_SURNAME_CONFLICT": len(ALTERNATIVE_SURNAMES),
+    "DISP_MIDDLE_NAME_CONFLICT": len(ALTERNATIVE_MIDDLE_NAMES),
+    "DISP_PHONETIC_SURNAME_DIVERGENCE": 6,
+    "DISP_GIVEN_NAME_GENDER_VARIANT": 1,                  # one gendered counterpart per client
+}
+
+
+def apportion_quotas(total: int, weights: Dict[str, float]) -> Dict[str, int]:
+    """
+    Largest-remainder (Hamilton) apportionment of `total` across weighted codes.
+
+    Guarantees the integer quotas SUM EXACTLY to `total` (with equal weights that yields the
+    classic "as even as integer division allows" split: e.g. 250 over 9 codes -> seven 28s and
+    two 27s), unlike naive rounding which can drift the dataset size.
+    """
+    if not weights:
+        return {}
+    if total <= 0:
+        return {code: 0 for code in weights}
+
+    positive = {code: float(weight) for code, weight in weights.items() if weight > 0}
+    if not positive:
+        raise ValueError("Disposition quota weights must contain at least one positive value.")
+
+    weight_sum = sum(positive.values())
+    exact = {code: total * (weight / weight_sum) for code, weight in positive.items()}
+    quotas = {code: int(math.floor(value)) for code, value in exact.items()}
+
+    remainder = total - sum(quotas.values())
+    if remainder > 0:
+        ranked = sorted(positive, key=lambda code: (-(exact[code] - quotas[code]), code))
+        for index in range(remainder):
+            quotas[ranked[index % len(ranked)]] += 1
+    return quotas
+
+
+def plan_disposition_quotas(
+    num_tp: int,
+    num_fp: int,
+    weights: Optional[Dict[str, float]] = None,
+    excludes: Optional[Set[str]] = None,
+    floors: Optional[Dict[str, int]] = None
+) -> Dict[str, int]:
+    """
+    Builds the per-code quota plan: the TP budget is apportioned over the TP codes and the FP
+    budget over the FP codes, so each label is equally represented WITHIN ITS DECISION FAMILY
+    while the requested 50/50 (or configured) escalate/disqualify split stays untouched.
+
+    weights : optional per-code weights ('--disposition_weights'); missing codes default to 1.0,
+              so an even split is simply the all-ones case.
+    excludes: codes removed from the plan ('--disposition_exclude'); their share is redistributed
+              over the remaining codes of the same family.
+    floors  : minimum counts ('--num_exact_matches' / '--num_gender_variants'). A reserved code is
+              pinned to its floor only when that floor EXCEEDS its even share; the rest of the
+              family budget is then apportioned over the remaining codes, so the family total —
+              and therefore the dataset size — is always exact.
+
+    Raises ValueError on an unknown code name, a family whose codes are all excluded/zero-weighted
+    while it still has budget, or floors that alone exceed a family budget.
+    """
+    weights = dict(weights or {})
+    excludes = set(excludes or ())
+    floors = {code: int(value) for code, value in (floors or {}).items()}
+
+    unknown = (set(weights) | excludes | set(floors)) - set(DISPOSITION_CODES)
+    if unknown:
+        raise ValueError(
+            f"Unknown disposition code(s): {', '.join(sorted(unknown))}. "
+            f"Valid codes: {', '.join(DISPOSITION_CODES)}."
+        )
+    if any(value < 0 for value in weights.values()):
+        raise ValueError("Disposition weights cannot be negative.")
+    if any(value < 0 for value in floors.values()):
+        raise ValueError("Reserved disposition floors cannot be negative.")
+
+    plan: Dict[str, int] = {}
+    for family_codes, budget, family_name in (
+        (DISPOSITION_TP_CODES, num_tp, "True Positive"),
+        (DISPOSITION_FP_CODES, num_fp, "False Positive"),
+    ):
+        enabled = [code for code in family_codes if code not in excludes]
+        family_weights = {code: float(weights.get(code, 1.0)) for code in enabled}
+        family_weights = {code: weight for code, weight in family_weights.items() if weight > 0}
+        if not family_weights:
+            if budget > 0:
+                raise ValueError(
+                    f"The {family_name} budget is {budget} but no {family_name} disposition code "
+                    f"is enabled (all excluded or zero-weighted)."
+                )
+            continue
+
+        quotas = apportion_quotas(budget, family_weights)
+
+        pinned = {
+            code: min(int(floors.get(code, 0)), budget)
+            for code in family_weights
+            if int(floors.get(code, 0)) > quotas[code]
+        }
+        if pinned:
+            pinned_total = sum(pinned.values())
+            if pinned_total > budget:
+                raise ValueError(
+                    f"Reserved floors for {', '.join(sorted(pinned))} total {pinned_total}, which "
+                    f"exceeds the {family_name} budget of {budget}."
+                )
+            rest_weights = {
+                code: weight for code, weight in family_weights.items() if code not in pinned
+            }
+            quotas = {code: 0 for code in family_weights}
+            quotas.update(pinned)
+            rest_budget = budget - pinned_total
+            if rest_budget > 0:
+                quotas.update(apportion_quotas(rest_budget, rest_weights))
+
+        plan.update(quotas)
+    return plan
+
+
+# Curated token indexes used to decide whether a client name can genuinely produce a code (and to
+# synthesise a capable name when the pool is too thin for its quota).
+_COMPOUND_HYPHEN_FORMS: Set[str] = {hyphen for hyphen, _ in COMPOUND_NAME_PAIRS}
+_COMPOUND_SPLIT_FORMS: Set[Tuple[str, str]] = {
+    (parts[0], parts[1]) for _, split in COMPOUND_NAME_PAIRS if len(parts := split.split()) == 2
+}
+_DIACRITIC_FORMS: Set[str] = (
+    {diacritic for diacritic, _ in DIACRITIC_PAIRS} | {ascii_form for _, ascii_form in DIACRITIC_PAIRS}
+)
+_TRANSLITERATION_TOKENS: Set[str] = set(TRANSLITERATION_VARIANTS)
+_PHONETIC_KEY_SURNAMES: Set[str] = set(PHONETIC_PAIRS)
+
+# Codes any two-token name can produce: their generator has no curated precondition.
+_UNCONDITIONAL_CODES: Set[str] = {
+    "DISP_MINOR_TYPO",
+    "DISP_TOKEN_ORDER_SWAP",
+    "DISP_MIDDLE_NAME_OMITTED",
+    "DISP_EXACT_NAME_MATCH",
+    "DISP_SURNAME_CONFLICT",
+    "DISP_MIDDLE_NAME_CONFLICT",
+}
+
+
+def _strip_diacritics(token: str) -> str:
+    """ASCII fold of a token (NFKD + ignore) — mirrors the generator's own stripping fallback."""
+    return unicodedata.normalize("NFKD", token).encode("ascii", "ignore").decode("ascii")
+
+
+def disposition_capability(name: str, code: str) -> bool:
+    """
+    True when `name` can genuinely produce `code`, i.e. when the code's generator will NOT hit one
+    of its silent fallbacks (apply_transliteration_variant -> DISP_MINOR_TYPO,
+    apply_diacritic_normalization -> DISP_MINOR_TYPO, apply_compound_name_restructuring ->
+    DISP_TOKEN_ORDER_SWAP) or return a neighbouring middle-name code.
+
+    This is the predicate that makes a balanced plan meaningful: quotas are drawn from capable
+    clients only, so the emitted label always matches the requested one.
+    """
+    tokens = name.split()
+    if len(tokens) < 2:
+        return False
+    if code in _UNCONDITIONAL_CODES:
+        return True
+    if code == "DISP_MIDDLE_NAME_ABBREVIATED":
+        return len(tokens) >= 3 and len(tokens[1]) > 2
+    if code == "DISP_MIDDLE_INITIAL_EXPANDED":
+        return len(tokens) >= 3 and len(tokens[1]) <= 2
+    if code == "DISP_TRANSLITERATION_VARIANT":
+        return any(token.lower() in _TRANSLITERATION_TOKENS for token in tokens)
+    if code == "DISP_DIACRITIC_STRIPPED":
+        for token in tokens:
+            if token in _DIACRITIC_FORMS:
+                return True
+            folded = _strip_diacritics(token)
+            if folded and folded != token:
+                return True
+        return False
+    if code == "DISP_COMPOUND_NAME_RESTRUCTURED":
+        if any(token in _COMPOUND_HYPHEN_FORMS for token in tokens):
+            return True
+        return any((tokens[i], tokens[i + 1]) in _COMPOUND_SPLIT_FORMS for i in range(len(tokens) - 1))
+    if code == "DISP_PHONETIC_SURNAME_DIVERGENCE":
+        return tokens[-1].lower() in _PHONETIC_KEY_SURNAMES
+    if code == "DISP_GIVEN_NAME_GENDER_VARIANT":
+        # The accurate test: the pair must be buildable (given name in the curated map and the
+        # swap must not repeat an existing token).
+        return build_gender_variant_pair(name) is not None
+    raise ValueError(f"Unhandled disposition code in disposition_capability(): {code}")
+
+
+def estimate_disposition_capacity(code: str, pool_size: int) -> int:
+    """Approximate number of distinct pairs a capability pool can yield for `code`."""
+    return pool_size * DISPOSITION_VARIANT_SPACE.get(code, 1)
+
+
+def _synthesise_capability_names(source_names: List[str], code: str, needed: int) -> List[str]:
+    """
+    Builds up to `needed` synthetic client names that are GUARANTEED capable for `code`, by
+    combining the curated token the mutation keys on with a given name or surname drawn from the
+    real pool (exactly the technique build_reserved_gender_variant_clients() already uses).
+
+    Only ever called to top up a thin capability pool, so a quota is never silently shortchanged
+    by a capability the source list happens not to contain (e.g. an ASCII-only sanctions list has
+    zero diacritic names — the names produced here are what make DISP_DIACRITIC_STRIPPED reachable).
+    """
+    if needed <= 0:
+        return []
+
+    givens = sorted({name.split()[0] for name in source_names if name.split()})
+    surnames = sorted({name.split()[-1] for name in source_names if name.split()})
+    if not givens or not surnames:
+        return []
+
+    synthetics: List[str] = []
+    seen: Set[str] = set()
+
+    for _ in range(needed * 3):
+        if len(synthetics) >= needed:
+            break
+        candidate: Optional[str] = None
+
+        if code == "DISP_DIACRITIC_STRIPPED":
+            candidate = f"{random.choice([d for d, _ in DIACRITIC_PAIRS])} {random.choice(surnames)}"
+        elif code == "DISP_COMPOUND_NAME_RESTRUCTURED":
+            candidate = f"{random.choice(sorted(_COMPOUND_HYPHEN_FORMS))} {random.choice(surnames)}"
+        elif code == "DISP_TRANSLITERATION_VARIANT":
+            token = random.choice(sorted(_TRANSLITERATION_TOKENS)).title()
+            candidate = (
+                f"{token} {random.choice(surnames)}" if random.random() < 0.5
+                else f"{random.choice(givens)} {token}"
+            )
+        elif code == "DISP_MIDDLE_INITIAL_EXPANDED":
+            initial = random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            candidate = f"{random.choice(givens)} {initial}. {random.choice(surnames)}"
+        elif code == "DISP_MIDDLE_NAME_ABBREVIATED":
+            middles = [m for m in ALTERNATIVE_MIDDLE_NAMES if len(m) > 2]
+            candidate = f"{random.choice(givens)} {random.choice(middles)} {random.choice(surnames)}"
+        elif code == "DISP_PHONETIC_SURNAME_DIVERGENCE":
+            surname = random.choice(sorted(_PHONETIC_KEY_SURNAMES)).title()
+            candidate = f"{random.choice(givens)} {surname}"
+
+        if not candidate:
+            break
+        key = candidate.lower()
+        if key in seen or not disposition_capability(candidate, code):
+            continue
+        seen.add(key)
+        synthetics.append(candidate)
+
+    return synthetics
+
+
+def build_disposition_capability_pools(
+    source_names: List[str],
+    quotas: Dict[str, int],
+    top_up: bool = True
+) -> Dict[str, List[str]]:
+    """
+    Builds, for every code with a non-zero quota, the pool of client names that can actually
+    produce that code.
+
+      Tier 1 — real pooled names (sdn.csv + global pools + Faker) passing disposition_capability();
+      Tier 2 — synthesised names (curated token + pooled given name/surname) topping the pool up to
+               the quota, so a thin capability can never starve its label.
+
+    The cross-gender code reuses build_reserved_gender_variant_clients(), which already pairs real
+    gendered given names with real surnames and interleaves masculine/feminine clients ~50/50.
+    """
+    pools: Dict[str, List[str]] = {}
+    for code, quota in quotas.items():
+        if quota <= 0:
+            continue
+        if code == "DISP_GIVEN_NAME_GENDER_VARIANT":
+            # Each gendered client yields exactly one deterministic pair (and some return None via
+            # the repeat-token guard), so the pool needs sourcing margin over the quota: extra
+            # clients beyond the real-name pool are synthesised, exactly like the gender-variant
+            # reserved category already does.
+            pool = build_reserved_gender_variant_clients(source_names, quota + max(8, quota // 5))
+        else:
+            pool = [name for name in source_names if disposition_capability(name, code)]
+            if top_up and len(pool) < quota:
+                seen = {name.lower() for name in pool}
+                for name in _synthesise_capability_names(source_names, code, quota - len(pool)):
+                    if name.lower() not in seen:
+                        seen.add(name.lower())
+                        pool.append(name)
+        random.shuffle(pool)
+        pools[code] = pool
+    return pools
+
+
+def describe_disposition_capacity(plan: Dict[str, int], pools: Dict[str, List[str]]) -> List[str]:
+    """
+    Pre-flight feasibility notes: a quota that exceeds what its capability pool can plausibly
+    yield (pool size x documented variant space per code). Purely advisory — the generation loop
+    is what ultimately fails loudly if a quota cannot be filled.
+    """
+    notes: List[str] = []
+    for code, quota in sorted(plan.items()):
+        if quota <= 0:
+            continue
+        pool_size = len(pools.get(code, []))
+        capacity = estimate_disposition_capacity(code, pool_size)
+        if capacity < quota:
+            notes.append(
+                f"{code}: quota {quota} vs ~{capacity} achievable pairs from {pool_size} capable names"
+            )
+    return notes
+
+
+def build_unique_pair_for_code(
+    source_names: List[str],
+    capability_pools: Dict[str, List[str]],
+    disposition_code: str,
+    seen_pairs: Set[Tuple[str, str]],
+    metrics: Dict[str, Any],
+    max_attempts: int = 60,
+    allow_rebalance: bool = False
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """
+    Builds ONE globally unique (client_name, hit_name) pair whose disposition_code is EXACTLY
+    `disposition_code`, registering it in `seen_pairs` before returning.
+
+    Two guarantees make the balance real rather than nominal:
+      - the client is drawn from the code's CAPABILITY pool, so the code-specific generator cannot
+        reach its silent fallback ('no transliteration token' -> DISP_MINOR_TYPO, ...);
+      - the emitted code is ASSERTED against the requested one. A mismatch (or a repeated pair) is
+        redrawn and tallied, so a neighbouring label can never absorb another label's quota.
+    Every collision is tallied in metrics['collision_retries'], every label mismatch in
+    metrics['label_mismatch_retries'].
+
+    Raises RuntimeError when the quota cannot be filled — failing loudly is deliberate, because
+    silently dropping the record would shorten the dataset while silently emitting it would break
+    the balance. Returns None only when allow_rebalance=True, signalling the caller to spill the
+    remaining count into whichever code still has capacity.
+    Returns (client_name, hit_name, matching_text, disposition_code, thinking).
+    """
+    pool = capability_pools.get(disposition_code) or source_names
+    if not pool:
+        raise ValueError(
+            f"No capable client names available for {disposition_code}. Enlarge the source pool "
+            f"(Faker augmentation, --augment_diversity) and re-run."
+        )
+
+    generator = DISPOSITION_GENERATORS.get(disposition_code)
+
+    for _ in range(max_attempts):
+        client_name = random.choice(pool)
+
+        if disposition_code == "DISP_GIVEN_NAME_GENDER_VARIANT":
+            built = build_gender_variant_pair(client_name)
+            if built is None:
+                metrics["label_mismatch_retries"] += 1
+                continue
+            hit_name, matching_text, emitted_code, thinking = built
+        else:
+            hit_name, matching_text, emitted_code, thinking = generator(client_name)  # type: ignore[misc]
+
+        if emitted_code != disposition_code:
+            # The generator fell back to a neighbouring code: this pair must not consume the quota.
+            metrics["label_mismatch_retries"] += 1
+            continue
+
+        pair_key = (client_name.strip().lower(), hit_name.strip().lower())
+        if pair_key in seen_pairs:
+            metrics["collision_retries"] += 1
+            continue
+
+        seen_pairs.add(pair_key)
+        return client_name, hit_name, matching_text, disposition_code, thinking
+
+    metrics["unfilled_disposition_quotas"] = metrics.get("unfilled_disposition_quotas", 0) + 1
+    if allow_rebalance:
+        return None
+    raise RuntimeError(
+        f"Could not build a unique {disposition_code} pair after {max_attempts} attempts from "
+        f"{len(pool)} capable client names. Enlarge the name pool, lower the per-label quota "
+        f"(--total_samples / --disposition_exclude), or pass --allow_disposition_rebalance to "
+        f"spill the remainder into another code."
+    )
+
+
+# ==============================================================================
 # ORCHESTRATION & COLLISION HANDLING
 # ==============================================================================
 
@@ -1629,7 +2289,9 @@ async def run_hybrid_generation(
     temp_dir: str = "temp",
     num_exact_matches: int = 0,
     num_gender_variants: int = 0,
-    ollama_enabled: bool = True
+    ollama_enabled: bool = True,
+    disposition_plan: Optional[Dict[str, int]] = None,
+    allow_disposition_rebalance: bool = False
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Coordinates Pipeline A and Pipeline B generation, enforces global pair uniqueness,
@@ -1647,11 +2309,28 @@ async def run_hybrid_generation(
     Requesting more reserved records than the matching budget raises ValueError; the
     counts are never silently clamped.
 
+    disposition_plan (per-code quotas, from plan_disposition_quotas) switches the run into
+    BALANCED mode: each code's quota is generated through the one mutation that produces that
+    code, using capability-sourced clients, and the emitted label is asserted. The reserved
+    counts are then read FROM the plan (a reserved code is just another quota), cross-gender
+    pairs are an ordinary part of their quota, and every Pipeline B item carries its assigned
+    code so the model narrates exactly that phenomenon. When disposition_plan is None the
+    original free-running generators are used unchanged.
+
     alpha is the PROGRAMMATIC share of the remaining budgets (the CLI passes
     fuzzy_pct / 100), and k_max is how many single-mutation draws build_unique_pipeline_a_pair
-    attempts per pair before it escalates to a double mutation.
+    attempts per pair before it escalates to a double mutation (legacy mode only).
     """
     start_time = time.time()
+
+    balanced = bool(disposition_plan)
+
+    if balanced:
+        # In balanced mode the reserved categories are ordinary plan entries, so their counts
+        # come from the plan and the cross-gender quota is generated like any other label.
+        assert disposition_plan is not None  # `balanced` implies a plan; aids type checkers
+        num_exact_matches = int(disposition_plan.get("DISP_EXACT_NAME_MATCH", 0))
+        num_gender_variants = int(disposition_plan.get("DISP_GIVEN_NAME_GENDER_VARIANT", 0))
 
     # Reserved categories are carved OUT of the decision budgets, so the grand total
     # stays exactly num_tp + num_fp. Mis-configuration fails loudly here as well, so a
@@ -1669,11 +2348,31 @@ async def run_hybrid_generation(
     remaining_tp = num_tp - num_exact_matches
     remaining_fp = num_fp - num_gender_variants
 
-    # Calculate allocations over the remaining (non-reserved) budget
-    n_tp_a = math.floor(alpha * remaining_tp)
-    n_fp_a = math.floor(alpha * remaining_fp)
-    n_tp_b = remaining_tp - n_tp_a
-    n_fp_b = remaining_fp - n_fp_a
+    # Per-code allocation between the two pipelines. DISP_EXACT_NAME_MATCH is rule-based only:
+    # an identical pair must never cost an LLM call, and generate_single_ollama_sample() rejects
+    # it outright. Everything else follows the configured fuzzy share.
+    capability_pools: Dict[str, List[str]] = {}
+    split_a: Dict[str, int] = {}
+    split_b: Dict[str, int] = {}
+    if balanced:
+        assert disposition_plan is not None
+        capability_pools = build_disposition_capability_pools(source_names, disposition_plan)
+        for code, quota in disposition_plan.items():
+            if code == "DISP_EXACT_NAME_MATCH":
+                split_a[code], split_b[code] = quota, 0
+            else:
+                n_a = math.floor(alpha * quota)
+                split_a[code], split_b[code] = n_a, quota - n_a
+        n_tp_a = sum(split_a[c] for c in DISPOSITION_TP_CODES if c in split_a)
+        n_fp_a = sum(split_a[c] for c in DISPOSITION_FP_CODES if c in split_a)
+        n_tp_b = sum(split_b[c] for c in DISPOSITION_TP_CODES if c in split_b)
+        n_fp_b = sum(split_b[c] for c in DISPOSITION_FP_CODES if c in split_b)
+    else:
+        # Calculate allocations over the remaining (non-reserved) budget
+        n_tp_a = math.floor(alpha * remaining_tp)
+        n_fp_a = math.floor(alpha * remaining_fp)
+        n_tp_b = remaining_tp - n_tp_a
+        n_fp_b = remaining_fp - n_fp_a
 
     records: List[Dict[str, str]] = []
     seen_pairs: Set[Tuple[str, str]] = set()
@@ -1696,11 +2395,70 @@ async def run_hybrid_generation(
         "collision_retries": 0,
         "ollama_failures": 0,
         "reserved_ollama_fallbacks": 0,
+        "balanced": balanced,
+        "disposition_plan": dict(disposition_plan or {}),
+        "label_mismatch_retries": 0,
+        "unfilled_disposition_quotas": 0,
+        "rebalanced_records": 0,
+        "capability_pool_sizes": {code: len(pool) for code, pool in capability_pools.items()},
     }
 
     # PIPELINE A: Programmatic Generation with Human Cognitive Reasoning
     # --------------------------------------------------------------------------
-    if n_tp_a + n_fp_a + num_exact_matches > 0:
+    if balanced:
+        # BALANCED PATH: one record per planned slot, generated by the mutation that owns that
+        # label. The builder asserts the emitted code, so a quota can never be filled by a
+        # neighbouring label's generator.
+        pipeline_a_codes = [code for code, count in split_a.items() for _ in range(count)]
+        random.shuffle(pipeline_a_codes)
+
+        if pipeline_a_codes:
+            print(
+                f"\n[Pipeline A] Generating {len(pipeline_a_codes)} balanced records across "
+                f"{len(split_a)} disposition codes with human cognitive reasoning..."
+            )
+            temp_csv_path = get_temp_csv_path(temp_dir)
+            batch_records = []
+            is_first_batch = True
+            pbar_a = tqdm(
+                total=len(pipeline_a_codes), desc="Pipeline A (Balanced Code Dispatch)", unit="records"
+            )
+
+            for code in pipeline_a_codes:
+                built = build_unique_pair_for_code(
+                    source_names, capability_pools, code, seen_pairs, metrics,
+                    allow_rebalance=allow_disposition_rebalance
+                )
+                if built is None:
+                    # --allow_disposition_rebalance: this quota is full but could not be filled,
+                    # so the slot is dropped and reported by the balance verification.
+                    metrics["rebalanced_records"] += 1
+                    pbar_a.update(1)
+                    continue
+                client_name, hit_name, matching_text, disposition_code, thinking = built
+
+                record = {
+                    "client_name": client_name,
+                    "hit_name": hit_name,
+                    "matching_text": matching_text,
+                    "disposition_code": disposition_code,
+                    "thinking": thinking,
+                    "decision": DISPOSITION_DECISIONS[disposition_code],
+                    "created_by": "rule_based"
+                }
+                is_first_batch = emit_record(record, records, batch_records, temp_csv_path, is_first_batch)
+                metrics["pipeline_a_count"] += 1
+                if disposition_code == "DISP_EXACT_NAME_MATCH":
+                    metrics["exact_match_count"] += 1
+                elif disposition_code == "DISP_GIVEN_NAME_GENDER_VARIANT":
+                    metrics["gender_variant_count"] += 1
+                pbar_a.update(1)
+
+            if batch_records:
+                write_records_batch_to_csv(batch_records, temp_csv_path, is_first_batch)
+            pbar_a.close()
+
+    if not balanced and (n_tp_a + n_fp_a + num_exact_matches) > 0:
         print(
             f"\n[Pipeline A] Generating {n_tp_a} TPs, {n_fp_a} FPs and "
             f"{num_exact_matches} exact-match TPs with human cognitive reasoning..."
@@ -1710,7 +2468,6 @@ async def run_hybrid_generation(
 
         temp_csv_path = get_temp_csv_path(temp_dir)
         batch_records = []
-        batch_size_write = 250
         is_first_batch = True
 
         pbar_a = tqdm(total=len(tasks_a) + num_exact_matches, desc="Pipeline A (Human-Emulating Engine)", unit="records")
@@ -1729,16 +2486,9 @@ async def run_hybrid_generation(
                 "decision": DECISION_TP,
                 "created_by": "rule_based"
             }
-            batch_records.append(record)
-            records.append(record)
+            is_first_batch = emit_record(record, records, batch_records, temp_csv_path, is_first_batch)
             metrics["pipeline_a_count"] += 1
             metrics["exact_match_count"] += 1
-
-            # Write batch to temp CSV every 250 records
-            if len(batch_records) >= batch_size_write:
-                write_records_batch_to_csv(batch_records, temp_csv_path, is_first_batch)
-                is_first_batch = False
-                batch_records = []
 
             pbar_a.update(1)
 
@@ -1759,16 +2509,9 @@ async def run_hybrid_generation(
                 "decision": decision,
                 "created_by": "rule_based"
             }
-            batch_records.append(record)
-            records.append(record)
+            is_first_batch = emit_record(record, records, batch_records, temp_csv_path, is_first_batch)
             metrics["pipeline_a_count"] += 1
-            
-            # Write batch to temp CSV every 250 records
-            if len(batch_records) >= batch_size_write:
-                write_records_batch_to_csv(batch_records, temp_csv_path, is_first_batch)
-                is_first_batch = False
-                batch_records = []
-            
+
             pbar_a.update(1)
         
         # Write remaining Pipeline A records
@@ -1779,7 +2522,16 @@ async def run_hybrid_generation(
     # --------------------------------------------------------------------------
     # PIPELINE B: Feeding Generated Pairs to Ollama for Human Review
     # --------------------------------------------------------------------------
-    total_b_samples = n_tp_b + n_fp_b + num_gender_variants
+    if balanced:
+        total_b_samples = sum(split_b.values())
+        b_codes = {code: count for code, count in split_b.items() if count > 0}
+        print(
+            f"\n[Pipeline B] Balanced quotas queued for review: {total_b_samples} records across "
+            f"{len(b_codes)} disposition codes."
+        )
+    else:
+        total_b_samples = n_tp_b + n_fp_b + num_gender_variants
+
     if total_b_samples > 0:
         if ollama_enabled:
             print(
@@ -1802,48 +2554,68 @@ async def run_hybrid_generation(
         # Pre-generate the candidate pairs for Ollama review. Each item is
         # (client_name, hit_name, matching_text, disposition_code, thinking, target_decision,
         #  enforce_disposition_code, enforce_decision). The enforce_* entries are None for
-        # generic alerts and pin the label for reserved categories.
+        # generic alerts in legacy mode and pin the label for reserved categories; in balanced
+        # mode they carry the ASSIGNED code of the quota slot, so the model is told which
+        # phenomenon to narrate and a contradicting narrative is discarded.
         fuzzy_items_b: List[Tuple[str, str, str, str, str, str, Optional[str], Optional[str]]] = []
 
-        for _ in range(n_tp_b):
-            c_name, h_name, m_text, d_code, th = build_unique_pipeline_a_pair(
-                source_names, DECISION_TP, seen_pairs, metrics, k_max=k_max
-            )
-            fuzzy_items_b.append((c_name, h_name, m_text, d_code, th, DECISION_TP, None, None))
-
-        for _ in range(n_fp_b):
-            c_name, h_name, m_text, d_code, th = build_unique_pipeline_a_pair(
-                source_names, DECISION_FP, seen_pairs, metrics, k_max=k_max
-            )
-            fuzzy_items_b.append((c_name, h_name, m_text, d_code, th, DECISION_FP, None, None))
-
-        # Reserved CROSS-GENDER false positives: the pair is built deterministically and
-        # Ollama narrates why two near-identical names are nevertheless two different
-        # people. The candidate list is over-provisioned so that a pair collision can
-        # never shorten the requested quota.
-        if num_gender_variants > 0:
-            over_provisioned = num_gender_variants + max(5, num_gender_variants // 5)
-            for c_name in build_reserved_gender_variant_clients(source_names, over_provisioned):
-                if metrics["gender_variant_count"] >= num_gender_variants:
-                    break
-                built = build_gender_variant_pair(c_name)
-                if built is None:
+        if balanced:
+            # One queued pair per planned slot, built by the mutation that owns that code and
+            # pinned to it, so the LLM share of the dataset is exactly as balanced as Pipeline A.
+            for code, count in split_b.items():
+                if count <= 0:
                     continue
-                h_name, m_text, d_code, th = built
-                key = (c_name.strip().lower(), h_name.strip().lower())
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
-                fuzzy_items_b.append((
-                    c_name, h_name, m_text, d_code, th, DECISION_FP,
-                    "DISP_GIVEN_NAME_GENDER_VARIANT", DECISION_FP
-                ))
-                metrics["gender_variant_count"] += 1
+                for _ in range(count):
+                    built = build_unique_pair_for_code(
+                        source_names, capability_pools, code, seen_pairs, metrics,
+                        allow_rebalance=allow_disposition_rebalance
+                    )
+                    if built is None:
+                        metrics["rebalanced_records"] += 1
+                        continue
+                    c_name, h_name, m_text, d_code, th = built
+                    fuzzy_items_b.append((c_name, h_name, m_text, d_code, th, DISPOSITION_DECISIONS[d_code], d_code, None))
+                    if d_code == "DISP_GIVEN_NAME_GENDER_VARIANT":
+                        metrics["gender_variant_count"] += 1
+        else:
+            for _ in range(n_tp_b):
+                c_name, h_name, m_text, d_code, th = build_unique_pipeline_a_pair(
+                    source_names, DECISION_TP, seen_pairs, metrics, k_max=k_max
+                )
+                fuzzy_items_b.append((c_name, h_name, m_text, d_code, th, DECISION_TP, None, None))
+
+            for _ in range(n_fp_b):
+                c_name, h_name, m_text, d_code, th = build_unique_pipeline_a_pair(
+                    source_names, DECISION_FP, seen_pairs, metrics, k_max=k_max
+                )
+                fuzzy_items_b.append((c_name, h_name, m_text, d_code, th, DECISION_FP, None, None))
+
+            # Reserved CROSS-GENDER false positives: the pair is built deterministically and
+            # Ollama narrates why two near-identical names are nevertheless two different
+            # people. The candidate list is over-provisioned so that a pair collision can
+            # never shorten the requested quota.
+            if num_gender_variants > 0:
+                over_provisioned = num_gender_variants + max(5, num_gender_variants // 5)
+                for c_name in build_reserved_gender_variant_clients(source_names, over_provisioned):
+                    if metrics["gender_variant_count"] >= num_gender_variants:
+                        break
+                    built = build_gender_variant_pair(c_name)
+                    if built is None:
+                        continue
+                    h_name, m_text, d_code, th = built
+                    key = (c_name.strip().lower(), h_name.strip().lower())
+                    if key in seen_pairs:
+                        continue
+                    seen_pairs.add(key)
+                    fuzzy_items_b.append((
+                        c_name, h_name, m_text, d_code, th, DECISION_FP,
+                        "DISP_GIVEN_NAME_GENDER_VARIANT", DECISION_FP
+                    ))
+                    metrics["gender_variant_count"] += 1
 
         random.shuffle(fuzzy_items_b)
         temp_csv_path = get_temp_csv_path(temp_dir)
         batch_records_b = []
-        batch_size_write = 250
         is_first_batch_b = not Path(temp_csv_path).exists()  # Check if file already has Pipeline A data
 
         pbar_b = tqdm(
@@ -1863,6 +2635,7 @@ async def run_hybrid_generation(
                     alert = await generate_single_ollama_sample(
                         ollama_client, ollama_model, c_name, h_name, tgt_dec, fallback_d_code, semaphore,
                         enforce_disposition_code=enforce_code, enforce_decision=enforce_dec,
+                        strict_disposition_code=balanced,
                         override_counter=override_counter
                     )
                 except Exception as exc:
@@ -1900,15 +2673,10 @@ async def run_hybrid_generation(
                     "created_by": "rule_based"
                 }
             
-            batch_records_b.append(record)
-            records.append(record)
-            
-            # Write batch to temp CSV every 250 records
-            if len(batch_records_b) >= batch_size_write:
-                write_records_batch_to_csv(batch_records_b, temp_csv_path, is_first_batch_b)
-                is_first_batch_b = False
-                batch_records_b = []
-            
+            is_first_batch_b = emit_record(
+                record, records, batch_records_b, temp_csv_path, is_first_batch_b
+            )
+
             pbar_b.update(1)
 
         await asyncio.gather(*(process_ollama_fuzzy_item(*item) for item in fuzzy_items_b))
@@ -1981,6 +2749,211 @@ async def verify_ollama_model(model_tag: str) -> str:
     )
 
 # ==============================================================================
+# DISPOSITION BALANCE & LABEL SEMANTICS VERIFICATION
+# ==============================================================================
+
+def verify_disposition_balance(
+    df_results: pd.DataFrame,
+    plan: Optional[Dict[str, int]],
+    tolerance: int = 0
+) -> Tuple[bool, List[str]]:
+    """
+    Compares the emitted per-code counts against the quota plan.
+
+    Exact equality is the contract when the plan could be filled (the builder guarantees it), so
+    any deviation means a quota was not honoured. `tolerance` exists only for
+    --allow_disposition_rebalance runs, where a remainder is deliberately spilled into another
+    code. Returns (ok, problems).
+    """
+    if not plan:
+        return True, []
+    if len(df_results) == 0:
+        return False, ["no records were generated"]
+
+    counts = df_results["disposition_code"].value_counts().to_dict()
+    problems: List[str] = []
+    for code, target in sorted(plan.items()):
+        actual = int(counts.get(code, 0))
+        if abs(actual - target) > tolerance:
+            problems.append(f"{code}: emitted {actual} vs planned {target} (delta {actual - target:+d})")
+    unplanned = sorted(set(counts) - set(plan))
+    if unplanned:
+        problems.append(f"unplanned code(s) emitted: {', '.join(unplanned)}")
+    return not problems, problems
+
+
+def _differing_token_indexes(client_tokens: List[str], hit_tokens: List[str]) -> List[int]:
+    """Indexes whose tokens differ (case-insensitively) between two equal-length token lists."""
+    return [i for i, (a, b) in enumerate(zip(client_tokens, hit_tokens)) if a.lower() != b.lower()]
+
+
+def audit_disposition_pair(client_name: str, hit_name: str, disposition_code: str) -> Optional[str]:
+    """
+    Independently re-derives the name-level phenomenon of a (client, hit) pair and reports a
+    problem description when it does NOT match the emitted disposition code.
+
+    This is the audit that keeps the balance honest: a balanced label distribution is worthless
+    if a label no longer describes the pair, so every record is checked against the mutation it
+    claims to represent (LLM-narrated rows included — the model only ever narrates a pair the
+    programmatic layer built). Returns None when the label is consistent.
+    """
+    client_tokens = client_name.split()
+    hit_tokens = hit_name.split()
+    same_length = len(client_tokens) == len(hit_tokens)
+    diffs = _differing_token_indexes(client_tokens, hit_tokens) if same_length else []
+
+    if disposition_code == "DISP_EXACT_NAME_MATCH":
+        if client_name.strip().lower() != hit_name.strip().lower():
+            return "not an identical name pair"
+
+    elif disposition_code == "DISP_GIVEN_NAME_GENDER_VARIANT":
+        if not is_gender_variant_pair(client_name, hit_name):
+            return "tokens do not differ by a single curated gendered given name"
+
+    elif disposition_code == "DISP_MINOR_TYPO":
+        if client_name.strip().lower() == hit_name.strip().lower():
+            return "pair is identical"
+        if is_gender_variant_pair(client_name, hit_name):
+            return "pair is a curated cross-gender variant (belongs to DISP_GIVEN_NAME_GENDER_VARIANT)"
+        if Levenshtein.distance(client_name.lower(), hit_name.lower()) > 2:
+            return "edit distance exceeds the documented <= 2 typo contract"
+
+    elif disposition_code == "DISP_TOKEN_ORDER_SWAP":
+        if sorted(t.lower() for t in client_tokens) != sorted(t.lower() for t in hit_tokens):
+            return "token multisets differ (not a pure reordering)"
+        if client_name.strip().lower() == hit_name.strip().lower():
+            return "no reordering occurred"
+
+    elif disposition_code == "DISP_MIDDLE_NAME_ABBREVIATED":
+        if not same_length or diffs != [1]:
+            return "more than the middle token changed"
+        if len(client_tokens[1]) <= 2 or hit_tokens[1] != client_tokens[1][0].upper() + ".":
+            return "middle token was not shortened to its initial"
+
+    elif disposition_code == "DISP_MIDDLE_INITIAL_EXPANDED":
+        if not same_length or diffs != [1]:
+            return "more than the middle token changed"
+        if len(client_tokens[1]) > 2 or len(hit_tokens[1]) <= 2:
+            return "middle initial was not expanded"
+        if hit_tokens[1] not in ALTERNATIVE_MIDDLE_NAMES:
+            return "expanded middle token is not from the curated middle-name pool"
+
+    elif disposition_code == "DISP_MIDDLE_NAME_OMITTED":
+        middle_removed = (
+            len(hit_tokens) == len(client_tokens) - 1
+            and client_tokens[0].lower() == hit_tokens[0].lower()
+            and client_tokens[2:] == hit_tokens[1:]
+        )
+        middle_initial_added = (
+            len(hit_tokens) == len(client_tokens) + 1
+            and re.fullmatch(r"[A-Za-z]\.", hit_tokens[1]) is not None
+            and client_tokens[0].lower() == hit_tokens[0].lower()
+            and client_tokens[1:] == hit_tokens[2:]
+        )
+        if not (middle_removed or middle_initial_added):
+            return "neither a middle-name omission nor an added middle initial"
+
+    elif disposition_code == "DISP_TRANSLITERATION_VARIANT":
+        if not same_length or len(diffs) != 1:
+            return "more than one token differs"
+        idx = diffs[0]
+        first, second = client_tokens[idx].lower(), hit_tokens[idx].lower()
+        known = [variant.lower() for variant in TRANSLITERATION_VARIANTS.get(first, [])]
+        reverse = [variant.lower() for variant in TRANSLITERATION_VARIANTS.get(second, [])]
+        if second not in known and first not in reverse:
+            return "differing token is not a known cross-standard transliteration variant"
+
+    elif disposition_code == "DISP_DIACRITIC_STRIPPED":
+        if not same_length or len(diffs) != 1:
+            return "more than one token differs"
+        idx = diffs[0]
+        client_token, hit_token = client_tokens[idx], hit_tokens[idx]
+        curated = (client_token, hit_token) in DIACRITIC_PAIRS or (hit_token, client_token) in DIACRITIC_PAIRS
+        if not curated and _strip_diacritics(client_token) != _strip_diacritics(hit_token):
+            return "differing token is not a diacritic-only variant"
+
+    elif disposition_code == "DISP_COMPOUND_NAME_RESTRUCTURED":
+        if client_name.strip().lower() == hit_name.strip().lower():
+            return "pair is identical"
+        dehyphenated_client = " ".join(client_name.replace("-", " ").split()).lower()
+        dehyphenated_hit = " ".join(hit_name.replace("-", " ").split()).lower()
+        if dehyphenated_client != dehyphenated_hit:
+            return "a hyphen split/merge does not account for the difference"
+
+    elif disposition_code == "DISP_SURNAME_CONFLICT":
+        if not same_length or diffs != [len(client_tokens) - 1]:
+            return "only the surname may differ for this code"
+        if hit_tokens[-1] not in ALTERNATIVE_SURNAMES:
+            return "replacement surname is not from the curated distinct-surname pool"
+
+    elif disposition_code == "DISP_MIDDLE_NAME_CONFLICT":
+        if same_length:
+            if diffs != [1]:
+                return "only the middle token may differ for this code"
+        else:
+            # Two-token client: the generator introduces a conflicting middle name, so the hit
+            # carries exactly one more token and the given name/surname are untouched.
+            introduced = (
+                len(hit_tokens) == len(client_tokens) + 1
+                and len(client_tokens) >= 2
+                and client_tokens[0].lower() == hit_tokens[0].lower()
+                and client_tokens[-1].lower() == hit_tokens[-1].lower()
+                and hit_tokens[1] in ALTERNATIVE_MIDDLE_NAMES
+            )
+            if not introduced:
+                return "neither a conflicting middle token nor an introduced middle name"
+
+    elif disposition_code == "DISP_PHONETIC_SURNAME_DIVERGENCE":
+        if client_name.strip().lower() == hit_name.strip().lower():
+            return "pair is identical"
+        _, client_surname = client_name.rsplit(None, 1) if len(client_tokens) >= 2 else ("", "")
+        _, hit_surname = hit_name.rsplit(None, 1) if len(hit_tokens) >= 2 else ("", "")
+        if not client_surname or not hit_surname:
+            return "pair is not a multi-token record"
+        curated_variants = [variant.lower() for variant in PHONETIC_PAIRS.get(client_surname.lower(), [])]
+        # A curated variant may itself be multi-token ('rossi' -> 'De Rossi'), in which case the
+        # hit is compared TOKEN-WISE, not by the last token alone.
+        curated_hit = hit_surname.lower() in curated_variants or any(
+            " ".join(hit_tokens[-len(variant.split()):]).lower() == variant.lower()
+            for variant in curated_variants
+        )
+        if not curated_hit:
+            # Documented generic substitution path of apply_phonetic_shift(): a distinct,
+            # well-formed surname is accepted, but a divergence that actually belongs to another
+            # code is not. (The balanced capability pool additionally restricts clients to
+            # curated PHONETIC_PAIRS surnames, so this path is legacy-only in practice.)
+            if _strip_diacritics(client_surname) == _strip_diacritics(hit_surname):
+                return "surnames differ only by diacritics (belongs to DISP_DIACRITIC_STRIPPED)"
+            if Levenshtein.distance(client_surname.lower(), hit_surname.lower()) <= 1:
+                return "surnames differ by a single character (belongs to DISP_MINOR_TYPO)"
+            if not all(ch.isalpha() or ch in "'- " for ch in hit_surname):
+                return "replacement surname is not a well-formed name token"
+
+    else:
+        return f"unknown disposition code '{disposition_code}'"
+
+    return None
+
+
+def verify_disposition_labels(df_results: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    Audits every row against audit_disposition_pair() and returns (ok, problems), where each
+    problem names the offending code, how many rows are inconsistent, and one example pair.
+    """
+    problems: List[str] = []
+    offenders: Dict[str, List[str]] = {}
+    for row in df_results.itertuples():
+        issue = audit_disposition_pair(row.client_name, row.hit_name, row.disposition_code)
+        if issue:
+            offenders.setdefault(row.disposition_code, []).append(
+                f"{issue} (e.g. {row.client_name!r} vs {row.hit_name!r})"
+            )
+    for code, entries in sorted(offenders.items()):
+        problems.append(f"{code}: {len(entries)} inconsistent row(s) — {entries[0]}")
+    return not problems, problems
+
+
+# ==============================================================================
 # TEMP FOLDER & INCREMENTAL CSV MANAGEMENT
 # ==============================================================================
 
@@ -2030,6 +3003,30 @@ def write_records_batch_to_csv(
     mode = 'w' if is_first_batch else 'a'
     header = is_first_batch
     df_batch.to_csv(csv_path, mode=mode, header=header, index=False)
+
+def emit_record(
+    record: Dict[str, str],
+    records: List[Dict[str, str]],
+    batch_records: List[Dict[str, str]],
+    csv_path: str,
+    is_first_batch: bool,
+    batch_size_write: int = 250
+) -> bool:
+    """
+    Appends one record to the in-memory result list and to the incremental temp CSV.
+
+    Shared by both pipelines (balanced and legacy) so the batching rule — flush every
+    `batch_size_write` records, headers only on the very first batch — exists in exactly one
+    place. `batch_records` is cleared in place and the updated is_first_batch flag is returned.
+    """
+    records.append(record)
+    batch_records.append(record)
+    if len(batch_records) >= batch_size_write:
+        write_records_batch_to_csv(batch_records, csv_path, is_first_batch)
+        batch_records.clear()
+        return False
+    return is_first_batch
+
 
 def cleanup_temp_csv(temp_dir: str = "temp", quiet: bool = False) -> bool:
     """
@@ -2084,7 +3081,7 @@ def resolve_counts_and_percentages(args) -> Tuple[int, int, float, float, float,
 
     # 2. Resolve Decision Balance (TP % vs FP % and total counts).
     # Explicit counts are resolved FIRST: --tp_percentage / --fp_percentage carry non-None
-    # defaults (40 / 60), so testing the percentages first made -tp / -fp dead code and
+    # defaults (50 / 50), so testing the percentages first made -tp / -fp dead code and
     # silently ignored the counts a caller asked for.
     explicit_tp = args.num_true_positives
     explicit_fp = args.num_false_positives
@@ -2138,8 +3135,8 @@ def resolve_counts_and_percentages(args) -> Tuple[int, int, float, float, float,
                 fp_pct = float(args.fp_percentage)
                 tp_pct = 100.0 - fp_pct
             else:
-                # Documented default split
-                tp_pct, fp_pct = 40.0, 60.0
+                # Documented default split: equal amounts of escalate (TP) and disqualify (FP)
+                tp_pct, fp_pct = 50.0, 50.0
 
             if not (0.0 <= tp_pct <= 100.0 and 0.0 <= fp_pct <= 100.0):
                 raise ValueError(f"TP/FP percentages must be between 0 and 100. Got TP: {tp_pct}%, FP: {fp_pct}%.")
@@ -2188,6 +3185,75 @@ def resolve_counts_and_percentages(args) -> Tuple[int, int, float, float, float,
 
     return num_tp, num_fp, tp_pct, fp_pct, ollama_pct, fuzzy_pct, num_exact_matches, num_gender_variants
 
+
+def parse_disposition_weights(raw: Optional[str]) -> Dict[str, float]:
+    """
+    Parses --disposition_weights: either an inline JSON object
+    ('{"DISP_MINOR_TYPO": 2, "DISP_EXACT_NAME_MATCH": 0.5}') or a path to a JSON file with the
+    same shape. Missing codes default to weight 1.0 inside plan_disposition_quotas().
+    """
+    if not raw:
+        return {}
+    text = raw
+    candidate = Path(raw)
+    if candidate.exists() and candidate.is_file():
+        text = candidate.read_text()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--disposition_weights is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("--disposition_weights must be a JSON object of {code: weight}.")
+    return {str(code): float(weight) for code, weight in parsed.items()}
+
+
+def parse_disposition_excludes(raw: Optional[str]) -> Set[str]:
+    """Parses --disposition_exclude: a comma-separated list of disposition codes to pin out."""
+    if not raw:
+        return set()
+    return {code.strip().upper() for code in raw.split(",") if code.strip()}
+
+
+def parse_faker_locales(raw: Optional[str]) -> List[str]:
+    """Parses --faker_locales: a comma-separated list of Faker locales (default FAKER_LOCALES)."""
+    if not raw:
+        return list(FAKER_LOCALES)
+    return [locale.strip() for locale in raw.split(",") if locale.strip()]
+
+
+def resolve_disposition_plan(
+    args, num_tp: int, num_fp: int, num_exact_matches: int, num_gender_variants: int
+) -> Optional[Dict[str, int]]:
+    """
+    Builds the per-code quota plan for the requested --disposition_balance mode, or returns None
+    for 'off' (the original free-running behaviour).
+
+    In 'even' / 'weighted' modes the reserved categories stop being special budgets and become
+    ordinary plan entries: --exact_match_pct / --gender_variant_pct (or their explicit counts)
+    then act as FLOORS, so a reserved code receives its even share whenever that share is larger.
+    The effective counts are surfaced by the caller, never adjusted silently.
+    """
+    mode = str(args.disposition_balance).lower()
+    if mode not in DISPOSITION_BALANCE_MODES:
+        raise ValueError(
+            f"--disposition_balance must be one of {', '.join(DISPOSITION_BALANCE_MODES)}; got '{mode}'."
+        )
+    if mode == "off":
+        return None
+
+    weights = parse_disposition_weights(args.disposition_weights) if mode == "weighted" else {}
+    return plan_disposition_quotas(
+        num_tp=num_tp,
+        num_fp=num_fp,
+        weights=weights,
+        excludes=parse_disposition_excludes(args.disposition_exclude),
+        floors={
+            "DISP_EXACT_NAME_MATCH": num_exact_matches,
+            "DISP_GIVEN_NAME_GENDER_VARIANT": num_gender_variants,
+        },
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate synthetic individual name-screening alert dataset for SLM fine-tuning."
@@ -2207,14 +3273,14 @@ def parse_args():
     parser.add_argument(
         "--tp_percentage", "--tp_pct",
         type=float,
-        default=40,
-        help="Target percentage for True Positive (TP) alerts (0.0 - 100.0, default: 40.0)."
+        default=50,
+        help="Target percentage for True Positive (TP) alerts (0.0 - 100.0, default: 50.0, i.e. an even split with FP)."
     )
     parser.add_argument(
         "--fp_percentage", "--fp_pct",
         type=float,
-        default=60,
-        help="Target percentage for False Positive (FP) alerts (0.0 - 100.0, default: 60.0)."
+        default=50,
+        help="Target percentage for False Positive (FP) alerts (0.0 - 100.0, default: 50.0, i.e. an even split with TP)."
     )
     parser.add_argument(
         "--num_true_positives", "-tp",
@@ -2253,6 +3319,60 @@ def parse_args():
         type=int,
         default=None,
         help="RESERVED: explicit integer count of exact-match TP alerts (overrides --exact_match_percentage)."
+    )
+    parser.add_argument(
+        "--disposition_balance",
+        type=str,
+        choices=list(DISPOSITION_BALANCE_MODES),
+        default="even",
+        help="Per-disposition-label quota strategy: 'even' (default) apportions the TP budget evenly over "
+             "the 9 TP codes and the FP budget evenly over the 4 FP codes, keeping every label equally "
+             "represented inside its decision family; 'weighted' uses --disposition_weights; 'off' "
+             "restores the original free-running random generators."
+    )
+    parser.add_argument(
+        "--disposition_weights",
+        type=str,
+        default=None,
+        help="With --disposition_balance weighted: JSON object or path to a JSON file of "
+             "{DISPOSITION_CODE: weight}; unlisted codes stay at weight 1.0 "
+             "(e.g. '{\"DISP_MINOR_TYPO\": 2}')."
+    )
+    parser.add_argument(
+        "--disposition_exclude",
+        type=str,
+        default=None,
+        help="Comma-separated disposition codes to pin out of the balanced plan; their share is "
+             "redistributed over the remaining codes of the same family "
+             "(e.g. 'DISP_EXACT_NAME_MATCH' to keep the easy label at its reserved percentage)."
+    )
+    parser.add_argument(
+        "--allow_disposition_rebalance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When a quota cannot be filled from its capability pool, spill (drop) the remainder and "
+             "report the deviation instead of failing loudly. Default: False."
+    )
+    parser.add_argument(
+        "--faker_names",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Augment the source names with Faker-generated names across Latin-script locales "
+             "(--faker_locales / --faker_names_per_locale). Default: True."
+    )
+    parser.add_argument(
+        "--faker_names_per_locale",
+        type=int,
+        default=150,
+        help="Number of Faker names to draw per locale (default: 150). 0 disables the Faker supply."
+    )
+    parser.add_argument(
+        "--faker_locales",
+        type=str,
+        default=None,
+        help="Comma-separated Faker locales (default: the built-in Latin-script list, "
+             "e.g. 'de_DE,fr_FR,cs_CZ'). Non-Latin-script locales are allowed but the mutation maps "
+             "operate on Latin tokens, so they mostly broaden the plain mutation pools."
     )
     parser.add_argument(
         "--ollama_percentage", "--ollama_pct",
@@ -2349,6 +3469,7 @@ def main():
 
     if args.seed is not None:
         random.seed(args.seed)
+        Faker.seed(args.seed)
 
     # 0. Setup temp folder with .gitignore, and clear any incremental CSV left behind by an
     # earlier (possibly crashed) run: otherwise that stale data would be appended to and then
@@ -2363,13 +3484,46 @@ def main():
     total_target = num_tp + num_fp
     alpha = fuzzy_pct / 100.0
 
+    # Per-disposition-label quota plan (None when --disposition_balance off, which restores the
+    # original free-running generators). In balanced modes the reserved categories become ordinary
+    # plan entries, so the requested percentages act as floors and the effective counts are
+    # reported below instead of being adjusted silently.
+    disposition_plan = resolve_disposition_plan(args, num_tp, num_fp, num_exact_matches, num_gender_variants)
+    if disposition_plan is not None:
+        planned_exact = disposition_plan.get("DISP_EXACT_NAME_MATCH", 0)
+        planned_gender = disposition_plan.get("DISP_GIVEN_NAME_GENDER_VARIANT", 0)
+        if planned_exact != num_exact_matches:
+            direction = "raised" if planned_exact > num_exact_matches else "lowered"
+            print(
+                f"[Balance] Exact-match TPs {direction} from {num_exact_matches} "
+                f"(reserved floor) to {planned_exact}."
+            )
+        if planned_gender != num_gender_variants:
+            direction = "raised" if planned_gender > num_gender_variants else "lowered"
+            print(
+                f"[Balance] Cross-gender FPs {direction} from {num_gender_variants} "
+                f"(reserved floor) to {planned_gender}."
+            )
+    else:
+        planned_exact, planned_gender = num_exact_matches, num_gender_variants
+
     # Reserved categories are carved out of the decision budgets, so Pipeline A emits the
     # exact matches plus its alpha share of the remaining budgets, while everything else
     # (Pipeline B plus every reserved cross-gender pair) is LLM-narrated.
-    pipeline_a_generic = (
-        math.floor(alpha * (num_tp - num_exact_matches)) + math.floor(alpha * (num_fp - num_gender_variants))
-    )
-    llm_records = total_target - num_exact_matches - pipeline_a_generic
+    if disposition_plan is not None:
+        # Balanced mode drives both pipelines from the plan itself: exact matches are rule-based
+        # only, and every other code sends (quota - floor(alpha * quota)) records to Pipeline B.
+        rule_based_records = sum(
+            quota if code == "DISP_EXACT_NAME_MATCH" else math.floor(alpha * quota)
+            for code, quota in disposition_plan.items()
+        )
+        llm_records = total_target - rule_based_records
+        pipeline_a_generic = total_target - llm_records - planned_exact
+    else:
+        pipeline_a_generic = (
+            math.floor(alpha * (num_tp - num_exact_matches)) + math.floor(alpha * (num_fp - num_gender_variants))
+        )
+        llm_records = total_target - num_exact_matches - pipeline_a_generic
     effective_ollama_pct = (llm_records / total_target * 100.0) if total_target > 0 else ollama_pct
 
     print("=" * 75)
@@ -2385,7 +3539,25 @@ def main():
     print(f"Multi-Ethnic Diversity:  {'ENABLED (Global Pools Included)' if args.augment_diversity else 'DISABLED'}")
     print(f"Ollama Concurrency:      Batch Size {args.batch_size}")
     print(f"Temp Folder:             {temp_dir}/")
-    
+    print(
+        f"Name Supply:             sdn.csv + global pools + "
+        f"{'Faker (' + str(len(parse_faker_locales(args.faker_locales))) + ' locales x ' + str(args.faker_names_per_locale) + ' names)' if args.faker_names else 'NO Faker augmentation'}"
+    )
+    if disposition_plan is not None:
+        if str(args.disposition_balance).lower() == "even":
+            balance_desc = (
+                f"every TP code gets an equal share of the {num_tp} TPs, "
+                f"every FP code an equal share of the {num_fp} FPs"
+            )
+        else:
+            balance_desc = (
+                f"the {num_tp} TPs and {num_fp} FPs are apportioned over their codes "
+                f"per --disposition_weights"
+            )
+        print(f"Disposition Balance:     {args.disposition_balance.upper()} — {balance_desc}")
+    else:
+        print(f"Disposition Balance:     OFF — free-running random generators (legacy behaviour)")
+
     # Estimate time to completion using the effective LLM share (the reserved exact
     # matches are rule-based and add no generation cost)
     est_seconds, est_time_str = estimate_generation_time(
@@ -2394,6 +3566,22 @@ def main():
     print(f"LLM Load:                {llm_records} LLM records ({effective_ollama_pct:.1f}%) | {total_target - llm_records} rule-based")
     print(f"Estimated Time:          ~{est_time_str}")
     print("=" * 75)
+
+    if disposition_plan is not None:
+        # Effective per-label targets (the reserved floors may have been raised to the even share)
+        print("\nDisposition Target Plan (per label, within its decision family):")
+        for family, codes in (("TP", DISPOSITION_TP_CODES), ("FP", DISPOSITION_FP_CODES)):
+            row = ", ".join(
+                f"{code.replace('DISP_', '').lower()}={disposition_plan.get(code, 0)}"
+                for code in codes
+                if disposition_plan.get(code, 0) > 0 or code not in parse_disposition_excludes(args.disposition_exclude)
+            )
+            print(f"  {family}: {row}")
+        if any(value == 0 for code, value in disposition_plan.items()):
+            zeroed = sorted(code for code, value in disposition_plan.items() if value == 0)
+            if zeroed:
+                print(f"  Zero-quota (excluded or floor-limited): {', '.join(zeroed)}")
+        print("-" * 75)
 
     # 1. Pre-flight verification
     # Records that reach Ollama: Pipeline B's share of the remaining budgets plus every
@@ -2408,7 +3596,7 @@ def main():
             print(f"[Pre-flight] Verified model '{resolved_model}' successfully.")
         except Exception as e:
             print(f"\n[Pre-flight Warning] {e}")
-            if num_gender_variants > 0:
+            if planned_gender > 0:
                 # Reserved cross-gender pairs are always LLM-narrated, so an
                 # unreachable model cannot silently degrade them to templates.
                 # Re-run with --num_gender_variants 0 for a fully offline run.
@@ -2424,8 +3612,30 @@ def main():
 
     # 2. Load and sanitize input dataset
     print(f"\n[Loading Data] Reading source names from '{args.input_csv_path}'...")
-    source_names = load_source_names(args.input_csv_path, args.name_column, augment_diversity=args.augment_diversity)
+    source_names = load_source_names(
+        args.input_csv_path,
+        args.name_column,
+        augment_diversity=args.augment_diversity,
+        use_faker=args.faker_names,
+        faker_names_per_locale=args.faker_names_per_locale,
+        faker_locales=parse_faker_locales(args.faker_locales),
+    )
     print(f"[Loading Data] Pool contains {len(source_names)} individual names across global ethnic origins.")
+
+    # 2b. Pre-flight disposition-capacity check: report any quota that exceeds what its capability
+    # pool can plausibly yield, before a long generation run starts.
+    if disposition_plan is not None:
+        preflight_pools = build_disposition_capability_pools(source_names, disposition_plan)
+        capacity_notes = describe_disposition_capacity(disposition_plan, preflight_pools)
+        if capacity_notes:
+            print("[Pre-flight Warning] Thin disposition capabilities:")
+            for note in capacity_notes:
+                print(f"  ! {note}")
+        else:
+            print(
+                "[Pre-flight] Every disposition quota fits its capability pool "
+                f"({len(preflight_pools)} codes sourced)."
+            )
 
     # 3. Execute Hybrid Generation
     df_results, metrics = asyncio.run(
@@ -2442,7 +3652,10 @@ def main():
             num_gender_variants=num_gender_variants,
             # Offline runs (no LLM records at all) must not create a client or attempt a
             # single call — this flag is what the Pipeline B block branches on.
-            ollama_enabled=total_b_expected > 0
+            ollama_enabled=total_b_expected > 0,
+            # Per-code quotas (None = legacy free-running generators)
+            disposition_plan=disposition_plan,
+            allow_disposition_rebalance=args.allow_disposition_rebalance
         )
     )
 
@@ -2509,15 +3722,15 @@ def main():
         if r.disposition_code == "DISP_MINOR_TYPO" and is_gender_variant_pair(r.client_name, r.hit_name)
     ]
     category_problems: List[str] = []
-    if len(exact_rows) != num_exact_matches:
-        category_problems.append(f"exact-match rows {len(exact_rows)} != requested {num_exact_matches}")
+    if len(exact_rows) != planned_exact:
+        category_problems.append(f"exact-match rows {len(exact_rows)} != planned {planned_exact}")
     if len(exact_rows) and (
         (exact_rows["disposition_code"] != "DISP_EXACT_NAME_MATCH").any()
         or (exact_rows["decision"] != DECISION_TP).any()
     ):
         category_problems.append("an identical name pair is not labelled exact-match/TP")
-    if len(gender_rows) != num_gender_variants:
-        category_problems.append(f"cross-gender rows {len(gender_rows)} != requested {num_gender_variants}")
+    if len(gender_rows) != planned_gender:
+        category_problems.append(f"cross-gender rows {len(gender_rows)} != planned {planned_gender}")
     if len(gender_rows) and (
         (gender_rows["decision"] != DECISION_FP).any()
         or not all(is_gender_variant_pair(r.client_name, r.hit_name) for r in gender_rows.itertuples())
@@ -2530,12 +3743,41 @@ def main():
     for problem in category_problems:
         print(f"  ! {problem}")
     print(
-        f"Reserved Emitted (req/out):         cross-gender FP {num_gender_variants}/{len(gender_rows)} | "
-        f"exact-match TP {num_exact_matches}/{len(exact_rows)}"
+        f"Reserved Emitted (req/out):         cross-gender FP {planned_gender}/{len(gender_rows)} | "
+        f"exact-match TP {planned_exact}/{len(exact_rows)}"
     )
     print(f"Reserved Ollama Fallbacks:          {metrics['reserved_ollama_fallbacks']}")
     overrides = metrics.get("enforcement_overrides", {})
     print(f"Label Enforcement Corrections:      {'none' if not overrides else ', '.join(f'{k}={v}' for k, v in sorted(overrides.items()))}")
+    print(f"Label Mismatch Redraws:             {metrics.get('label_mismatch_retries', 0)}")
+    if metrics.get("rebalanced_records"):
+        print(f"Rebalanced (unfilled quota) Records: {metrics['rebalanced_records']}")
+
+    # Per-disposition-label balance: the emitted counts must equal the quota plan. Equality is
+    # the contract; when --allow_disposition_rebalance spills a remainder into another code, the
+    # spilled count is reported instead of failing the balance.
+    if disposition_plan is not None:
+        rebalanced_count = int(metrics.get("rebalanced_records", 0))
+        balance_ok, balance_problems = verify_disposition_balance(
+            df_results, disposition_plan, tolerance=rebalanced_count
+        )
+        print(f"Disposition Balance ({args.disposition_balance.upper()}):{' ' * (18 - len(args.disposition_balance))}"
+              f"{'PASSED' if balance_ok else 'FAILED'}")
+        for problem in balance_problems:
+            print(f"  ! {problem}")
+        if rebalanced_count:
+            print(f"  (re-balanced records spilled into other codes: {rebalanced_count}; see Unfilled Disposition Quotas)")
+        for code, target in sorted(disposition_plan.items()):
+            actual = int((df_results['disposition_code'] == code).sum())
+            marker = "OK " if actual == target else "DEV"
+            print(f"  [{marker}] {code:33s} target {target:5d} | emitted {actual:5d}")
+
+    # Independent label-semantics audit: a balanced distribution is worthless if a label no longer
+    # describes its pair, so every row is re-derived and checked against the code it carries.
+    labels_ok, label_problems = verify_disposition_labels(df_results)
+    print(f"Label Semantics Audit:              {'PASSED' if labels_ok else 'FAILED'}")
+    for problem in label_problems:
+        print(f"  ! {problem}")
     print("-" * 75)
     print("Disposition Code Distribution:")
     disp_counts = df_results['disposition_code'].value_counts().sort_index()
