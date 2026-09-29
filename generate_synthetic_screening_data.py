@@ -167,7 +167,9 @@ COGNITIVE REVIEW PRINCIPLES:
        DISP_MIDDLE_NAME_CONFLICT     — Middle names are irreconcilably different
        DISP_PHONETIC_SURNAME_DIVERGENCE — Surnames phonetically shifted but distinct
        DISP_GIVEN_NAME_GENDER_VARIANT — Given name differs only by gender inflection (e.g. Daniel/Daniela)
-   - "thinking": Detailed step-by-step human cognitive reasoning explaining the name comparison.
+   - "thinking": Detailed step-by-step human cognitive reasoning following this structured template:
+       Client '<client_name>' vs hit '<hit_name>'. Given: <given_analysis>. Middle: <middle_analysis>. Surname: <surname_analysis>. <boundary_analysis>. <domain_principle>. Therefore: <DISPOSITION_CODE> -> <DECISION>.
+       Notice the thinking MUST conclude with: Therefore: <DISPOSITION_CODE> -> <DECISION>. (e.g. "Therefore: DISP_MINOR_TYPO -> escalate to analyst.")
    - "decision": Strictly 'escalate to analyst' (True Positive) or 'disqualify' (False Positive)."""
 
 # Known non-individual indicators to filter out corporate entities
@@ -609,6 +611,34 @@ KEYBOARD_NEIGHBORS = {
     'z': 'asx'
 }
 
+def _walk_equal_length_notes(
+    client_tokens: List[str],
+    hit_tokens: List[str],
+) -> Tuple[str, str, str]:
+    """
+    Token-walk notes for a pair whose token COUNT is unchanged (typo, reorder, transliteration,
+    diacritic, compound, surname/middle conflict, gender variant): the given note compares token 0,
+    the surname note compares the last token, and the middle note covers every token in between
+    (or reports absence when neither side has a middle span).
+    """
+    given_note = _token_walk_note(client_tokens[0], hit_tokens[0])
+    surname_note = _token_walk_note(client_tokens[-1], hit_tokens[-1])
+    client_mid = client_tokens[1:-1]
+    hit_mid = hit_tokens[1:-1]
+    if not client_mid and not hit_mid:
+        middle_note = "absent from both records"
+    elif client_mid == hit_mid:
+        middle_note = f"{' '.join(client_mid)!r} matches exactly" if client_mid else "absent from both records"
+    elif len(client_mid) == 1 and len(hit_mid) == 1:
+        middle_note = _token_walk_note(client_mid[0], hit_mid[0])
+    else:
+        middle_note = (
+            f"client middle span '{' '.join(client_mid)}' recorded as '{' '.join(hit_mid)}'"
+            if client_mid or hit_mid else "absent from both records"
+        )
+    return given_note, middle_note, surname_note
+
+
 def apply_minor_typo(name: str) -> Tuple[str, str, str, str]:
     """
     Applies a Levenshtein distance <= 2 typo mutation (character transposition,
@@ -680,12 +710,21 @@ def apply_minor_typo(name: str) -> Tuple[str, str, str, str]:
     unaffected = [t for i, t in enumerate(name.split()) if i != chosen_token_idx]
     matching_text = " ".join(unaffected) if unaffected else name[:3]
 
-    thinking = (
-        f"Comparing the name strings: the primary identifying words '{matching_text}' match identically. "
-        f"The candidate hit has a minor clerical difference in word '{orig_token}' (written as '{mutated_token}'), "
-        f"which reflects an {desc}. This is a classic typographical error resulting from fast typing or clerical transcription. "
-        f"Because the underlying names match closely with no conflicting family or personal names, "
-        f"the candidate is highly likely the same individual. Recommendation: Escalate to analyst."
+    given_note, middle_note, surname_note = _walk_equal_length_notes(tokens, hit_name.split())
+
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=given_note,
+        middle_note=middle_note,
+        surname_note=surname_note,
+        boundary=(
+            f"The affected token shows {desc}; "
+            f"{_pick_variant(BOUNDARY_MINOR_TYPO)}"
+        ),
+        principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+        disposition_code="DISP_MINOR_TYPO",
+        decision=DECISION_TP,
     )
     disposition_code = "DISP_MINOR_TYPO"
     return hit_name, matching_text, disposition_code, thinking
@@ -709,12 +748,21 @@ def apply_token_transposition(name: str) -> Tuple[str, str, str, str]:
 
     matching_text = " ".join(tokens)
 
-    thinking = (
-        f"Evaluating word order: both records contain the exact same set of names ('{matching_text}'). "
-        f"The variation is purely due to {desc}. In global screening databases, names are frequently recorded "
-        f"in family-name-first or given-name-first convention depending on the jurisdiction or database format. "
-        f"All individual name parts are fully accounted for with zero missing or conflicting names. "
-        f"This refers to the identical individual. Recommendation: Escalate to analyst."
+    given_note, middle_note, surname_note = _walk_equal_length_notes(tokens, hit_name.split())
+
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=given_note,
+        middle_note=middle_note,
+        surname_note=surname_note,
+        boundary=(
+            f"The variation is {desc} under {_pick_variant(ORDER_MECHANISMS)}; "
+            f"{_pick_variant(BOUNDARY_TOKEN_ORDER_SWAP)}"
+        ),
+        principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+        disposition_code="DISP_TOKEN_ORDER_SWAP",
+        decision=DECISION_TP,
     )
     disposition_code = "DISP_TOKEN_ORDER_SWAP"
     return hit_name, matching_text, disposition_code, thinking
@@ -749,11 +797,43 @@ def apply_middle_truncation_expansion(name: str) -> Tuple[str, str, str, str]:
         disposition_code = "DISP_MIDDLE_NAME_OMITTED"
         matching_text = f"{tokens[0]} {tokens[1]}"
 
-    thinking = (
-        f"Reviewing the core identifiers: the client and candidate hit share the exact same first name and surname ('{matching_text}'). "
-        f"The only difference is the {desc}. In banking and legal records, middle names are routinely abbreviated to initials "
-        f"or expanded without changing legal identity. There are no contradictory identity markers present. "
-        f"This requires manual verification. Recommendation: Escalate to analyst."
+    client_tokens = tokens
+    hit_tokens = hit_name.split()
+    if disposition_code == "DISP_MIDDLE_NAME_ABBREVIATED":
+        given_note = _token_walk_note(client_tokens[0], hit_tokens[0])
+        middle_note = (
+            f"'{mid}' shortened to initial '{hit_tokens[1]}' "
+            f"({_pick_variant(MIDDLE_ABBREV_MECHANISMS)})"
+        )
+        surname_note = _token_walk_note(client_tokens[-1], hit_tokens[-1])
+        boundary = _pick_variant(BOUNDARY_MIDDLE_ABBREVIATED)
+    elif disposition_code == "DISP_MIDDLE_INITIAL_EXPANDED":
+        given_note = _token_walk_note(client_tokens[0], hit_tokens[0])
+        middle_note = (
+            f"middle initial '{mid}' spelled out as '{hit_tokens[1]}' "
+            f"({_pick_variant(MIDDLE_EXPAND_MECHANISMS)})"
+        )
+        surname_note = _token_walk_note(client_tokens[-1], hit_tokens[-1])
+        boundary = _pick_variant(BOUNDARY_MIDDLE_EXPANDED)
+    else:
+        given_note = _token_walk_note(client_tokens[0], hit_tokens[0])
+        middle_note = (
+            f"middle initial '{initial}.' added in the hit "
+            f"({_pick_variant(OMISSION_MECHANISMS)})"
+        )
+        surname_note = _token_walk_note(client_tokens[-1], hit_tokens[-1])
+        boundary = _pick_variant(BOUNDARY_MIDDLE_OMITTED)
+
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=given_note,
+        middle_note=middle_note,
+        surname_note=surname_note,
+        boundary=boundary,
+        principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+        disposition_code=disposition_code,
+        decision=DECISION_TP,
     )
     return hit_name, matching_text, disposition_code, thinking
 
@@ -789,11 +869,18 @@ def apply_phonetic_shift(name: str) -> Tuple[str, str, str, str]:
     hit_name = " ".join(tokens)
     matching_text = " ".join(tokens[:-1])
 
-    thinking = (
-        f"Analyzing the match: the first name '{matching_text}' matches across both records. "
-        f"However, the candidate has a different family name: {desc}. "
-        f"While the two surnames may sound somewhat similar or share phonetic traits, they represent distinct family heritages and legal names. "
-        f"A shared common first name with a diverging family name indicates two separate individuals. Recommendation: Disqualify."
+    given_note, middle_note, surname_note = _walk_equal_length_notes(name.split(), hit_name.split())
+
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=given_note,
+        middle_note=middle_note,
+        surname_note=f"{surname_note} ({desc})",
+        boundary=_pick_variant(BOUNDARY_PHONETIC_DIVERGENCE),
+        principle=_pick_variant(PRINCIPLE_FP_DISTINCT),
+        disposition_code="DISP_PHONETIC_SURNAME_DIVERGENCE",
+        decision=DECISION_FP,
     )
     disposition_code = "DISP_PHONETIC_SURNAME_DIVERGENCE"
     return hit_name, matching_text, disposition_code, thinking
@@ -817,11 +904,19 @@ def apply_middle_name_conflict(name: str) -> Tuple[str, str, str, str]:
         matching_text = f"{tokens[0]} {tokens[1]}"
         desc = f"introduction of a distinct middle name '{mid}'"
 
-    thinking = (
-        f"Evaluating middle names: the first name and surname ('{matching_text}') match identically. "
-        f"However, there is an irreconcilable discrepancy: {desc}. "
-        f"These are two entirely separate personal given names—not a nickname, abbreviation, or typing slip. "
-        f"When two individuals have completely different middle names, they are distinct people who happen to share a first and last name. Recommendation: Disqualify."
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=_token_walk_note(tokens[0], hit_name.split()[0]),
+        middle_note=(
+            f"{desc} "
+            f"({_pick_variant(MIDDLE_ABBREV_MECHANISMS) if 'introduction' not in desc else _pick_variant(OMISSION_MECHANISMS)})"
+        ),
+        surname_note=_token_walk_note(tokens[-1], hit_name.split()[-1]),
+        boundary=_pick_variant(BOUNDARY_MIDDLE_CONFLICT),
+        principle=_pick_variant(PRINCIPLE_FP_DISTINCT),
+        disposition_code="DISP_MIDDLE_NAME_CONFLICT",
+        decision=DECISION_FP,
     )
     disposition_code = "DISP_MIDDLE_NAME_CONFLICT"
     return hit_name, matching_text, disposition_code, thinking
@@ -838,20 +933,202 @@ def apply_distinct_surname_swap(name: str) -> Tuple[str, str, str, str]:
     hit_name = " ".join(tokens)
     matching_text = " ".join(tokens[:-1])
 
-    thinking = (
-        f"Comparing identity tokens: both client and candidate share the common first name '{matching_text}'. "
-        f"However, the surnames are completely different: client '{orig_surname}' vs candidate '{new_surname}'. "
-        f"In identity screening, the family name is the primary differentiator, and these two surnames have zero relation. "
-        f"A match on a common given name alone without a matching surname is a coincidental false positive. Recommendation: Disqualify."
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=_token_walk_note(" ".join(tokens[:-1]), matching_text),
+        middle_note="absent from both records",
+        surname_note=f"'{orig_surname}' recorded as '{new_surname}'",
+        boundary=_pick_variant(BOUNDARY_SURNAME_CONFLICT),
+        principle=_pick_variant(PRINCIPLE_FP_DISTINCT),
+        disposition_code="DISP_SURNAME_CONFLICT",
+        decision=DECISION_FP,
     )
     disposition_code = "DISP_SURNAME_CONFLICT"
     return hit_name, matching_text, disposition_code, thinking
+
+# =============================================================================
+# TRACE-AT-SERVE CoT COMPOSER (shared by every rule-based generator)
+# The served SLM emits the full thinking trace, so every trace follows ONE skeleton with
+# loose vocabulary: anchor -> token walk (given, middle, surname) -> boundary sentence
+# (why this code and NOT its nearest confusable code) -> domain principle -> contractual
+# closing line `Therefore: <CODE> -> <decision>.` The closing line is what the model is
+# trained to terminate on at serve time, and verify_thinking_closure() parses it back out.
+# =============================================================================
+
+# Domain principles, one per family so the principle sentence cannot become a label giveaway.
+# Variants rotate by seed for lexical variety; wording only, semantics identical.
+PRINCIPLE_TP_IDENTITY: Tuple[str, ...] = (
+    "Recording conventions differ across systems without changing legal identity.",
+    "The same individual is routinely recorded differently across jurisdictions and databases.",
+    "Name-level recording differences do not by themselves establish a different person.",
+)
+PRINCIPLE_FP_DISTINCT: Tuple[str, ...] = (
+    "Coincidental name overlap without full identity is the classic false positive pattern.",
+    "A shared token alone never establishes the same natural person.",
+    "Distinct identity markers outweigh any partial name overlap.",
+)
+PRINCIPLE_GENDER_MISMATCH: Tuple[str, ...] = (
+    "A mismatch in the recorded gender rules out the same natural person.",
+    "Two personal names of different genders describe two different individuals.",
+)
+PRINCIPLE_ANALYST_REVIEW: Tuple[str, ...] = (
+    "Name identity alone is never sufficient for adverse action; an analyst must still confirm the secondary identifiers.",
+    "An analyst must still confirm the secondary identifiers before the alert is closed.",
+)
+
+
+def _pick_variant(variants: Tuple[str, ...]) -> str:
+    """Rotates paraphrase variants by seed for lexical variety (wording only)."""
+    return random.choice(variants)
+
+
+def compose_thinking(
+    *,
+    client_name: str,
+    hit_name: str,
+    given_note: str,
+    middle_note: str,
+    surname_note: str,
+    boundary: str,
+    principle: str,
+    disposition_code: str,
+    decision: str,
+) -> str:
+    """
+    Assembles a trace-at-serve thinking field from the fixed 4-move skeleton. Every generator
+    supplies its per-position notes plus the code's boundary sentence; the composer owns the
+    anchor line, the move order and the contractual closing line, so no generator can drift
+    the format.
+    """
+    return (
+        f"Client '{client_name}' vs hit '{hit_name}'. "
+        f"Given: {given_note}. "
+        f"Middle: {middle_note}. "
+        f"Surname: {surname_note}. "
+        f"{boundary} "
+        f"{principle} "
+        f"Therefore: {disposition_code} -> {decision}."
+    )
+
+
+def _token_walk_note(client_token: Optional[str], hit_token: Optional[str]) -> str:
+    """One token-position verdict for the token walk ('matches exactly' or the mechanism)."""
+    if client_token is None and hit_token is None:
+        return "absent from both records"
+    if client_token is not None and hit_token is not None and client_token == hit_token:
+        return f"'{client_token}' matches exactly"
+    if client_token is None:
+        return f"absent from the client record, recorded as '{hit_token}' in the hit"
+    if hit_token is None:
+        return f"'{client_token}' present in the client record, absent from the hit"
+    return f"'{client_token}' recorded as '{hit_token}'"
+
+
 
 # ==============================================================================
 # REAL-WORLD NOISE MUTATIONS (5 NEW — ALL TRUE POSITIVE)
 # These simulate name recording differences that genuinely occur in production
 # screening datasets. All produce the same individual recorded differently.
 # ==============================================================================
+
+# =============================================================================
+# PRONUNCIATION / RECORDING MECHANISM NOTES (shared vocabulary for token walks)
+# =============================================================================
+
+TYPO_MECHANISMS: Tuple[str, ...] = (
+    "a single typographical slip",
+    "a minor clerical transcription slip",
+    "a keyboard-level entry slip",
+)
+ORDER_MECHANISMS: Tuple[str, ...] = (
+    "family-name-first vs given-name-first convention",
+    "jurisdiction-dependent token ordering",
+)
+MIDDLE_ABBREV_MECHANISMS: Tuple[str, ...] = (
+    "routine abbreviation of a middle name to its initial",
+    "standard shortening of a middle name to an initial",
+)
+MIDDLE_EXPAND_MECHANISMS: Tuple[str, ...] = (
+    "routine expansion of a middle initial to the full name",
+    "standard expansion of a recorded middle initial",
+)
+OMISSION_MECHANISMS: Tuple[str, ...] = (
+    "omission under form-field constraints during onboarding",
+    "absence from one record's captured fields",
+)
+TRANSLITERATION_MECHANISMS: Tuple[str, ...] = (
+    "different international romanisation standards",
+    "cross-standard transliteration conventions",
+)
+DIACRITIC_MECHANISMS: Tuple[str, ...] = (
+    "ASCII-only legacy system stripping",
+    "Unicode normalisation differences across systems",
+)
+COMPOUND_MECHANISMS: Tuple[str, ...] = (
+    "hyphen split vs merged recording conventions",
+    "inconsistent compound-name entry conventions",
+)
+
+# =============================================================================
+# BOUNDARY SENTENCES: why THIS code and NOT its nearest confusable code.
+# Each maps 1:1 onto an audit_disposition_pair() rule — the taught reasoning and the
+# verified semantics stay the same object.
+# =============================================================================
+
+BOUNDARY_MINOR_TYPO: Tuple[str, ...] = (
+    "The change is a clerical slip, not a curated gender inflection and not a transliteration variant.",
+    "This reads as fast-typing noise, not a different personal name and not a romanisation difference.",
+)
+BOUNDARY_TOKEN_ORDER_SWAP: Tuple[str, ...] = (
+    "Every character is accounted for; only the sequence changed, so this is reordering rather than a typo or omission.",
+    "No token is added, removed or altered — the sole phenomenon is token order.",
+)
+BOUNDARY_MIDDLE_ABBREVIATED: Tuple[str, ...] = (
+    "The initial is still present, so this is shortening rather than absence.",
+    "The middle name is reduced to its initial, not omitted and not replaced.",
+)
+BOUNDARY_MIDDLE_EXPANDED: Tuple[str, ...] = (
+    "The full name expands the recorded initial rather than contradicting it.",
+    "The recorded initial is spelled out, not swapped for a conflicting name.",
+)
+BOUNDARY_MIDDLE_OMITTED: Tuple[str, ...] = (
+    "Absence of a middle name is absence of data, not a conflicting identity marker.",
+    "A missing middle token is non-information, not a discrepancy between two names.",
+)
+BOUNDARY_TRANSLITERATION: Tuple[str, ...] = (
+    "These are two romanisations of one name under different standards, not two distinct names.",
+    "The variation follows documented transliteration conventions rather than a clerical error.",
+)
+BOUNDARY_DIACRITIC: Tuple[str, ...] = (
+    "The base letters are identical; only the marks were stripped, so this is not a typo.",
+    "Character identity holds apart from diacritics — an encoding artefact, not a different name.",
+)
+BOUNDARY_COMPOUND: Tuple[str, ...] = (
+    "The token count changed because a hyphen was split or merged, not because tokens moved.",
+    "Hyphen handling explains the restructuring; no name was added, dropped or reordered.",
+)
+BOUNDARY_EXACT_MATCH: Tuple[str, ...] = (
+    "There is no typographical slip, abbreviation, reordering, transliteration or diacritic variation to reconcile.",
+    "No name-level discrepancy of any kind is available that could explain the alert away.",
+)
+BOUNDARY_SURNAME_CONFLICT: Tuple[str, ...] = (
+    "The two surnames have zero phonetic or etymological relation.",
+    "The surnames are entirely different names with no shared root.",
+)
+BOUNDARY_MIDDLE_CONFLICT: Tuple[str, ...] = (
+    "These are two entirely separate personal names, not a shortening, slip or transliteration.",
+    "The middle tokens are irreconcilably different names rather than recording variants.",
+)
+BOUNDARY_PHONETIC_DIVERGENCE: Tuple[str, ...] = (
+    "The surnames share sound but denote legally distinct family names — not a typo and not a transliteration pair.",
+    "Phonetic resemblance does not make these the same surname; they are distinct legal names.",
+)
+BOUNDARY_GENDER_VARIANT: Tuple[str, ...] = (
+    "This is a different personal name of the opposite gender, not a recording variant of one name.",
+    "The given-name difference marks a different individual, not a typo, abbreviation or transliteration.",
+)
+
 
 # Cross-standard transliteration map: token.lower() → list of known variants
 TRANSLITERATION_VARIANTS: Dict[str, List[str]] = {
@@ -1025,12 +1302,22 @@ def apply_transliteration_variant(name: str) -> Tuple[str, str, str, str]:
         hit_tokens[idx] = new_tok
         hit_name = " ".join(hit_tokens)
         matching_text = " ".join(t for i, t in enumerate(tokens) if i != idx)
-        thinking = (
-            f"Reviewing the name pair: '{orig}' in the client record and '{new_tok}' in the candidate hit. "
-            f"These are recognised transliteration variants of the same name under different international romanisation standards. "
-            f"The remaining name tokens {matching_text!r} match exactly. "
-            f"Given the well-documented variation in how this name is romanised across jurisdictions and databases, "
-            f"these are the same individual recorded under different transliteration conventions. Recommendation: Escalate to analyst."
+
+        given_note, middle_note, surname_note = _walk_equal_length_notes(tokens, hit_tokens)
+        thinking = compose_thinking(
+            client_name=name,
+            hit_name=hit_name,
+            given_note=given_note,
+            middle_note=middle_note,
+            surname_note=surname_note,
+            boundary=(
+                f"'{orig}' rendered as '{new_tok}' under "
+                f"{_pick_variant(TRANSLITERATION_MECHANISMS)}; "
+                f"{_pick_variant(BOUNDARY_TRANSLITERATION)}"
+            ),
+            principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+            disposition_code="DISP_TRANSLITERATION_VARIANT",
+            decision=DECISION_TP,
         )
     else:
         # Fallback: apply a minor typo as character-level noise
@@ -1055,12 +1342,22 @@ def apply_diacritic_normalization(name: str) -> Tuple[str, str, str, str]:
                 hit_tokens[i] = ascii_form
                 hit_name = " ".join(hit_tokens)
                 matching_text = " ".join(t for j, t in enumerate(tokens) if j != i)
-                thinking = (
-                    f"Examining the name token: client record contains '{diacritic_form}' while the candidate hit shows '{ascii_form}'. "
-                    f"This is a classic diacritic normalisation difference. Many legacy banking systems and SWIFT messaging platforms "
-                    f"strip accented characters to produce ASCII-only representations, converting '{diacritic_form}' to '{ascii_form}'. "
-                    f"The remaining name tokens {matching_text!r} are identical. "
-                    f"This is the same individual—the difference is a system encoding artefact, not a different person. Recommendation: Escalate to analyst."
+
+                given_note, middle_note, surname_note = _walk_equal_length_notes(tokens, hit_tokens)
+                thinking = compose_thinking(
+                    client_name=name,
+                    hit_name=hit_name,
+                    given_note=given_note,
+                    middle_note=middle_note,
+                    surname_note=surname_note,
+                    boundary=(
+                        f"'{diacritic_form}' rendered as '{ascii_form}' under "
+                        f"{_pick_variant(DIACRITIC_MECHANISMS)}; "
+                        f"{_pick_variant(BOUNDARY_DIACRITIC)}"
+                    ),
+                    principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+                    disposition_code="DISP_DIACRITIC_STRIPPED",
+                    decision=DECISION_TP,
                 )
                 disposition_code = "DISP_DIACRITIC_STRIPPED"
                 return hit_name, matching_text, disposition_code, thinking
@@ -1069,11 +1366,22 @@ def apply_diacritic_normalization(name: str) -> Tuple[str, str, str, str]:
                 hit_tokens[i] = diacritic_form
                 hit_name = " ".join(hit_tokens)
                 matching_text = " ".join(t for j, t in enumerate(tokens) if j != i)
-                thinking = (
-                    f"Examining the name token: client record contains '{ascii_form}' while the candidate hit shows the accented form '{diacritic_form}'. "
-                    f"This is a diacritic restoration difference—the candidate database stores the full Unicode form while the client record uses ASCII. "
-                    f"The remaining name tokens {matching_text!r} are identical. "
-                    f"This is the same individual under different character encoding standards. Recommendation: Escalate to analyst."
+
+                given_note, middle_note, surname_note = _walk_equal_length_notes(tokens, hit_tokens)
+                thinking = compose_thinking(
+                    client_name=name,
+                    hit_name=hit_name,
+                    given_note=given_note,
+                    middle_note=middle_note,
+                    surname_note=surname_note,
+                    boundary=(
+                        f"'{ascii_form}' rendered as '{diacritic_form}' under "
+                        f"{_pick_variant(DIACRITIC_MECHANISMS)}; "
+                        f"{_pick_variant(BOUNDARY_DIACRITIC)}"
+                    ),
+                    principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+                    disposition_code="DISP_DIACRITIC_STRIPPED",
+                    decision=DECISION_TP,
                 )
                 disposition_code = "DISP_DIACRITIC_STRIPPED"
                 return hit_name, matching_text, disposition_code, thinking
@@ -1093,10 +1401,22 @@ def apply_diacritic_normalization(name: str) -> Tuple[str, str, str, str]:
     if changed_idx >= 0:
         hit_name = " ".join(hit_tokens)
         matching_text = " ".join(t for j, t in enumerate(tokens) if j != changed_idx)
-        thinking = (
-            f"Examining the name: client record contains '{orig_tok}' while the candidate hit shows the ASCII-normalised form '{hit_tokens[changed_idx]}'. "
-            f"This is a diacritic stripping difference introduced by ASCII-only legacy systems. "
-            f"The remaining tokens match identically. This is the same individual. Recommendation: Escalate to analyst."
+
+        given_note, middle_note, surname_note = _walk_equal_length_notes(tokens, hit_tokens)
+        thinking = compose_thinking(
+            client_name=name,
+            hit_name=hit_name,
+            given_note=given_note,
+            middle_note=middle_note,
+            surname_note=surname_note,
+            boundary=(
+                f"'{orig_tok}' rendered as '{hit_tokens[changed_idx]}' under "
+                f"{_pick_variant(DIACRITIC_MECHANISMS)}; "
+                f"{_pick_variant(BOUNDARY_DIACRITIC)}"
+            ),
+            principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+            disposition_code="DISP_DIACRITIC_STRIPPED",
+            decision=DECISION_TP,
         )
         disposition_code = "DISP_DIACRITIC_STRIPPED"
         return hit_name, matching_text, disposition_code, thinking
@@ -1123,12 +1443,27 @@ def apply_compound_name_restructuring(name: str) -> Tuple[str, str, str, str]:
                 hit_tokens = tokens[:i] + split_parts + tokens[i+1:]
                 hit_name = " ".join(hit_tokens)
                 matching_text = " ".join(t for j, t in enumerate(tokens) if j != i)
-                thinking = (
-                    f"Examining the name structure: the client record shows '{hyphen_form}' as a hyphenated compound name, "
-                    f"while the candidate hit records it as '{split_form}' with a space separator. "
-                    f"Hyphenated compound names are frequently split or joined differently across database systems depending on "
-                    f"the jurisdiction's data entry conventions. The underlying name identity is the same. "
-                    f"The remaining tokens {matching_text!r} match identically. Recommendation: Escalate to analyst."
+
+                given_note = _token_walk_note(tokens[0], hit_tokens[0])
+                surname_note = _token_walk_note(tokens[-1], hit_tokens[-1])
+                middle_note = (
+                    _token_walk_note(" ".join(tokens[1:-1]), " ".join(hit_tokens[1:-1]))
+                    if len(tokens) > 2 or len(hit_tokens) > 2 else "absent from both records"
+                )
+                thinking = compose_thinking(
+                    client_name=name,
+                    hit_name=hit_name,
+                    given_note=given_note,
+                    middle_note=middle_note,
+                    surname_note=surname_note,
+                    boundary=(
+                        f"'{hyphen_form}' recorded as '{split_form}' under "
+                        f"{_pick_variant(COMPOUND_MECHANISMS)}; "
+                        f"{_pick_variant(BOUNDARY_COMPOUND)}"
+                    ),
+                    principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+                    disposition_code="DISP_COMPOUND_NAME_RESTRUCTURED",
+                    decision=DECISION_TP,
                 )
                 disposition_code = "DISP_COMPOUND_NAME_RESTRUCTURED"
                 return hit_name, matching_text, disposition_code, thinking
@@ -1142,11 +1477,27 @@ def apply_compound_name_restructuring(name: str) -> Tuple[str, str, str, str]:
                     hit_tokens = tokens[:i] + [hyphen_form] + tokens[i+2:]
                     hit_name = " ".join(hit_tokens)
                     matching_text = " ".join(t for j, t in enumerate(tokens) if j not in (i, i+1))
-                    thinking = (
-                        f"Examining the name structure: the client record shows '{split_parts[0]} {split_parts[1]}' as two separate tokens, "
-                        f"while the candidate hit records it as the hyphenated form '{hyphen_form}'. "
-                        f"This is a compound name formatting difference caused by inconsistent data entry conventions across systems. "
-                        f"The matching text {matching_text!r} is otherwise identical. Recommendation: Escalate to analyst."
+
+                    given_note = _token_walk_note(tokens[0], hit_tokens[0])
+                    surname_note = _token_walk_note(tokens[-1], hit_tokens[-1])
+                    middle_note = (
+                        _token_walk_note(" ".join(tokens[1:-1]), " ".join(hit_tokens[1:-1]))
+                        if len(tokens) > 2 or len(hit_tokens) > 2 else "absent from both records"
+                    )
+                    thinking = compose_thinking(
+                        client_name=name,
+                        hit_name=hit_name,
+                        given_note=given_note,
+                        middle_note=middle_note,
+                        surname_note=surname_note,
+                        boundary=(
+                            f"'{split_parts[0]} {split_parts[1]}' recorded as '{hyphen_form}' under "
+                            f"{_pick_variant(COMPOUND_MECHANISMS)}; "
+                            f"{_pick_variant(BOUNDARY_COMPOUND)}"
+                        ),
+                        principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+                        disposition_code="DISP_COMPOUND_NAME_RESTRUCTURED",
+                        decision=DECISION_TP,
                     )
                     disposition_code = "DISP_COMPOUND_NAME_RESTRUCTURED"
                     return hit_name, matching_text, disposition_code, thinking
@@ -1168,25 +1519,31 @@ def apply_middle_name_omission(name: str) -> Tuple[str, str, str, str]:
         hit_tokens = [tokens[0]] + tokens[2:]
         hit_name = " ".join(hit_tokens)
         matching_text = f"{tokens[0]} {tokens[-1]}"
-        thinking = (
-            f"Reviewing the name pair: the client record contains '{name}' with the middle name '{mid}', "
-            f"while the candidate hit shows '{hit_name}' with the middle name omitted entirely. "
-            f"It is common for clients to omit middle names during onboarding due to form field constraints "
-            f"or personal preference, while official sanctions lists and regulatory databases include the full name. "
-            f"The first name and surname {matching_text!r} are identical. "
-            f"The absence of a middle name is not a conflict—it is an absence of data. Recommendation: Escalate to analyst."
+        middle_note = (
+            f"middle name '{mid}' omitted from the hit "
+            f"({_pick_variant(OMISSION_MECHANISMS)})"
         )
     else:
         # Add middle initial (reverse omission — hit has extra middle initial)
         initial = random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         hit_name = f"{tokens[0]} {initial}. {tokens[-1]}"
         matching_text = f"{tokens[0]} {tokens[-1]}"
-        thinking = (
-            f"Reviewing the name pair: the client record shows '{name}' with no middle initial, "
-            f"while the candidate hit shows '{hit_name}' with middle initial '{initial}.'. "
-            f"Clients frequently omit their middle initial during onboarding. The first name and surname "
-            f"'{matching_text}' match exactly with no conflicting tokens. Recommendation: Escalate to analyst."
+        middle_note = (
+            f"middle initial '{initial}.' present only in the hit "
+            f"({_pick_variant(OMISSION_MECHANISMS)})"
         )
+
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=hit_name,
+        given_note=_token_walk_note(tokens[0], hit_name.split()[0]),
+        middle_note=middle_note,
+        surname_note=_token_walk_note(tokens[-1], hit_name.split()[-1]),
+        boundary=_pick_variant(BOUNDARY_MIDDLE_OMITTED),
+        principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+        disposition_code="DISP_MIDDLE_NAME_OMITTED",
+        decision=DECISION_TP,
+    )
     disposition_code = "DISP_MIDDLE_NAME_OMITTED"
     return hit_name, matching_text, disposition_code, thinking
 
@@ -1262,14 +1619,22 @@ def build_gender_variant_pair(client_name: str) -> Optional[Tuple[str, str, str,
     orig_gender = GENDER_VARIANT_TOKEN_GENDERS.get(_fold_token(orig_token), "gendered")
     new_gender = GENDER_VARIANT_TOKEN_GENDERS.get(_fold_token(new_token), "gendered")
 
-    thinking = (
-        f"Reviewing the pair token by token: the client record reads '{client_name}' and the candidate hit reads '{hit_name}'. "
-        f"Every other token {matching_text!r} is identical — the surname included — so the alert is driven by a near-identical string match. "
-        f"The single difference is the given name: the client record carries the {orig_gender} form '{orig_token}', "
-        f"while the candidate hit carries its {new_gender} counterpart '{new_token}'. "
-        f"That is a different personal name rather than a typo, an abbreviation or a transliteration of one name. "
-        f"A shared surname combined with an almost identical first name is the classic near-identical false positive pattern, "
-        f"and the mismatch in the recorded gender rules out the same natural person. Recommendation: Disqualify."
+    thinking = compose_thinking(
+        client_name=client_name,
+        hit_name=hit_name,
+        given_note=(
+            f"client carries the {orig_gender} form '{orig_token}', "
+            f"hit carries its {new_gender} counterpart '{new_token}'"
+        ),
+        middle_note=(
+            _token_walk_note(" ".join(tokens[1:-1]), " ".join(hit_tokens[1:-1]))
+            if len(tokens) > 2 else "absent from both records"
+        ),
+        surname_note=_token_walk_note(tokens[-1], hit_tokens[-1]),
+        boundary=_pick_variant(BOUNDARY_GENDER_VARIANT),
+        principle=_pick_variant(PRINCIPLE_GENDER_MISMATCH),
+        disposition_code="DISP_GIVEN_NAME_GENDER_VARIANT",
+        decision=DECISION_FP,
     )
     disposition_code = "DISP_GIVEN_NAME_GENDER_VARIANT"
     return hit_name, matching_text, disposition_code, thinking
@@ -1286,14 +1651,19 @@ def apply_exact_name_match(name: str) -> Tuple[str, str, str, str]:
     never registered in the random Pipeline A generator list.
     Returns (hit_name, matching_text, disposition_code, thinking).
     """
-    thinking = (
-        f"Reviewing the alert: the client record and the candidate hit are identical character for character — '{name}'. "
-        f"Every token matches exactly, with no typographical slip, no middle-name abbreviation or expansion, no token reordering, "
-        f"no transliteration difference and no diacritic variation to reconcile. "
-        f"An exact full-name match against a screening list record is the strongest possible name-level indicator, and there is no "
-        f"name-level discrepancy available that could explain the alert away. "
-        f"Name identity alone is never sufficient for adverse action, so an analyst must still confirm the secondary identifiers "
-        f"(date of birth, nationality, address) before the alert is closed. Recommendation: Escalate to analyst."
+    thinking = compose_thinking(
+        client_name=name,
+        hit_name=name,
+        given_note=_token_walk_note(name.split()[0], name.split()[0]),
+        middle_note=(
+            _token_walk_note(" ".join(name.split()[1:-1]), " ".join(name.split()[1:-1]))
+            if len(name.split()) > 2 else "absent from both records"
+        ),
+        surname_note=_token_walk_note(name.split()[-1], name.split()[-1]),
+        boundary=_pick_variant(BOUNDARY_EXACT_MATCH),
+        principle=_pick_variant(PRINCIPLE_ANALYST_REVIEW),
+        disposition_code="DISP_EXACT_NAME_MATCH",
+        decision=DECISION_TP,
     )
     disposition_code = "DISP_EXACT_NAME_MATCH"
     return name, name, disposition_code, thinking
@@ -1328,14 +1698,28 @@ def generate_pipeline_a_sample(
         hit_name, matching_text, disposition_code, thinking = gen(client_name)
 
         if double_mutation:
-            hit_name2, matching_text2, _, thinking2 = apply_minor_typo(hit_name)
+            hit_name2, matching_text2, _, _ = apply_minor_typo(hit_name)
             hit_name = hit_name2
             matching_text = matching_text2
             disposition_code = "DISP_MINOR_TYPO"
-            thinking = (
-                f"Detailed multi-step evaluation: comparing client '{client_name}' against candidate hit '{hit_name}'. "
-                f"{thinking} Additionally, a secondary clerical variation is observed: {thinking2} "
-                f"Overall assessment confirms high likelihood of the same person despite multiple minor formatting variations."
+            # Recompose thinking with uniform CoT format for the double mutation
+            c_toks = client_name.split()
+            h_toks = hit_name.split()
+            g_note, m_note, s_note = _walk_equal_length_notes(c_toks, h_toks) if len(c_toks) == len(h_toks) else (
+                _token_walk_note(c_toks[0], h_toks[0]),
+                _token_walk_note(" ".join(c_toks[1:-1]), " ".join(h_toks[1:-1])) if min(len(c_toks), len(h_toks)) > 2 else "absent from one or both records",
+                _token_walk_note(c_toks[-1], h_toks[-1]),
+            )
+            thinking = compose_thinking(
+                client_name=client_name,
+                hit_name=hit_name,
+                given_note=g_note,
+                middle_note=m_note,
+                surname_note=s_note,
+                boundary=_pick_variant(BOUNDARY_MINOR_TYPO),
+                principle=_pick_variant(PRINCIPLE_TP_IDENTITY),
+                disposition_code=disposition_code,
+                decision=DECISION_TP,
             )
     else:  # DECISION_FP
         generators = [
@@ -1348,14 +1732,27 @@ def generate_pipeline_a_sample(
 
         if double_mutation:
             # Use surname conflict as compounding FP signal
-            hit_name2, matching_text2, disposition_code2, thinking2 = apply_distinct_surname_swap(hit_name)
+            hit_name2, matching_text2, disposition_code2, _ = apply_distinct_surname_swap(hit_name)
             hit_name = hit_name2
             matching_text = matching_text2
             disposition_code = disposition_code2
-            thinking = (
-                f"Multi-factor discrepancy review: evaluating client '{client_name}' against '{hit_name}'. "
-                f"{thinking} Furthermore, a compounding conflict is identified: {thinking2} "
-                f"Decisive cumulative discrepancies confirm these are separate individuals."
+            c_toks = client_name.split()
+            h_toks = hit_name.split()
+            g_note, m_note, s_note = _walk_equal_length_notes(c_toks, h_toks) if len(c_toks) == len(h_toks) else (
+                _token_walk_note(c_toks[0], h_toks[0]),
+                _token_walk_note(" ".join(c_toks[1:-1]), " ".join(h_toks[1:-1])) if min(len(c_toks), len(h_toks)) > 2 else "absent from one or both records",
+                _token_walk_note(c_toks[-1], h_toks[-1]),
+            )
+            thinking = compose_thinking(
+                client_name=client_name,
+                hit_name=hit_name,
+                given_note=g_note,
+                middle_note=m_note,
+                surname_note=s_note,
+                boundary=_pick_variant(BOUNDARY_SURNAME_CONFLICT),
+                principle=_pick_variant(PRINCIPLE_FP_DISTINCT),
+                disposition_code=disposition_code,
+                decision=DECISION_FP,
             )
 
     # Invariant: a name-level mutation must never return the client name verbatim.
@@ -1515,6 +1912,18 @@ def clean_ollama_json_response(
         data["decision"] = enforce_decision
         _tally("decision")
 
+    # Ensure thinking concludes with the standardized contractual closure
+    expected_closure = f"Therefore: {data['disposition_code']} -> {data['decision']}."
+    thinking_text = data.get("thinking", "").strip()
+    if not thinking_text.endswith(expected_closure):
+        # If there's an existing 'Therefore: ...' ending with different text or truncated, replace or append
+        idx = thinking_text.rfind("Therefore:")
+        if idx != -1 and idx >= len(thinking_text) - 100:
+            thinking_text = thinking_text[:idx].rstrip()
+        if thinking_text and not thinking_text.endswith("."):
+            thinking_text += "."
+        data["thinking"] = f"{thinking_text} {expected_closure}".strip()
+
     return data
 
 async def generate_single_ollama_sample(
@@ -1615,7 +2024,7 @@ async def generate_single_ollama_sample(
         f"- \"matching_text\": overlapping name words or tokens shared between the two names\n"
         f"- \"disposition_code\": EXACTLY one of the following codes (copy it exactly):\n"
         f"{disposition_vocab}\n"
-        f"- \"thinking\": human cognitive review of the name comparison\n"
+        f"- \"thinking\": step-by-step reasoning formatted as: Client '{client_name}' vs hit '{hit_name}'. Given: <note>. Middle: <note>. Surname: <note>. <confusable boundary note>. <screening principle>. Therefore: <disposition_code> -> <decision>.\n"
         f"- \"decision\": 'escalate to analyst' or 'disqualify'"
     )
 
@@ -2953,6 +3362,26 @@ def verify_disposition_labels(df_results: pd.DataFrame) -> Tuple[bool, List[str]
     return not problems, problems
 
 
+def verify_thinking_closure(df_results: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    Verifies that every row's thinking text strictly ends with the contractual closure line:
+    `Therefore: <disposition_code> -> <decision>.`
+    where <disposition_code> and <decision> match the row's actual disposition_code and decision.
+    """
+    problems: List[str] = []
+    offenders: Dict[str, List[str]] = {}
+    for row in df_results.itertuples():
+        expected = f"Therefore: {row.disposition_code} -> {row.decision}."
+        thinking_text = str(row.thinking).strip()
+        if not thinking_text.endswith(expected):
+            offenders.setdefault(row.disposition_code, []).append(
+                f"expected suffix '{expected}', got ending: {thinking_text[-50:]!r}"
+            )
+    for code, entries in sorted(offenders.items()):
+        problems.append(f"{code}: {len(entries)} row(s) failed thinking closure — {entries[0]}")
+    return not problems, problems
+
+
 # ==============================================================================
 # TEMP FOLDER & INCREMENTAL CSV MANAGEMENT
 # ==============================================================================
@@ -3777,6 +4206,12 @@ def main():
     labels_ok, label_problems = verify_disposition_labels(df_results)
     print(f"Label Semantics Audit:              {'PASSED' if labels_ok else 'FAILED'}")
     for problem in label_problems:
+        print(f"  ! {problem}")
+
+    # Trace-at-serve CoT closure audit: every row must terminate with `Therefore: <CODE> -> <decision>.`
+    closure_ok, closure_problems = verify_thinking_closure(df_results)
+    print(f"Thinking Closure Audit:             {'PASSED' if closure_ok else 'FAILED'}")
+    for problem in closure_problems:
         print(f"  ! {problem}")
     print("-" * 75)
     print("Disposition Code Distribution:")
